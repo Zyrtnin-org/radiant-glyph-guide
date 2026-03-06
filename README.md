@@ -2,7 +2,9 @@
 
 **Complete Technical Documentation for Building NFT Applications on Radiant**
 
-This guide provides everything you need to implement Glyph NFTs on the Radiant blockchain. It includes critical discoveries from real-world implementation that are not documented elsewhere.
+This guide provides everything you need to implement Glyph NFTs on the Radiant blockchain, updated for **V2** (block 410,000+). It includes critical discoveries from real-world implementation, all 11 Glyph protocol types, V2 opcode reference, and updated fee calculations for the post-V2 fee increase.
+
+Designed to be used as context for AI coding agents (Claude, Cursor, etc.) — paste the README into your session and start building. See [BUILDING_WITH_CLAUDE.md](BUILDING_WITH_CLAUDE.md) for MCP server setup and AI-assisted workflow tips.
 
 > **FOR AI AGENTS — Start Here:**
 > - **First NFT mint?** → Read sections 2 (Critical Requirements), 4 (On-Chain Images), 6 (CBOR Payload), then 7-9 (Commit/Reveal/Signing)
@@ -1489,14 +1491,17 @@ See [Thumbnail Size vs Cost Tradeoffs](#thumbnail-size-vs-cost-tradeoffs) and [F
 
 ---
 
-**Last Updated:** 2026-02-27
+**Last Updated:** 2026-03-05
 **Based on Verified Mainnet Transactions:**
 - With thumbnail: `27390efab1e3168c05301b18f6cdfd553a6d122a41496d0f5e104e79a918be7e`
 
-**Critical Discoveries Documented:**
+**Key Highlights:**
 1. On-chain images (`main` field) required for wallet display
 2. CBOR encoding mandatory (JSON = "Unknown NFT")
-3. Optimal thumbnail: 225px WebP @ 90% quality (~22KB, ~0.22 RXD) for best quality/cost balance
+3. Optimal thumbnail: 225px WebP @ 90% quality (~22KB, ~0.22 RXD pre-V2)
+4. V2-ready fee calculations with pre/post cost tables
+5. All 11 Glyph protocol types and 6 new V2 opcodes documented
+6. MCP server integration for AI-assisted development (see [BUILDING_WITH_CLAUDE.md](BUILDING_WITH_CLAUDE.md))
 
 **License:** MIT
 **Radiant Blockchain:** https://radiantblockchain.org
