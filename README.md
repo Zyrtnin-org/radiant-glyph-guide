@@ -99,6 +99,48 @@ This design ensures:
 2. Players own their NFTs (can transfer and manage them)
 3. Clean fund management (UTXOs stay with platform wallet)
 
+### Glossary
+
+Terms you'll see throughout this guide. If you've worked with Bitcoin-style
+chains before, most will be familiar; a few are Radiant/Glyph-specific.
+
+- **Photon** — Radiant's smallest unit. 1 RXD = 100,000,000 photons (same
+  ratio as BTC : satoshi). Fee rates in this guide are in photons/byte.
+- **Commit TX** — First of the two-transaction mint. Creates an output locked
+  by a custom `nftCommitScript` that validates the glyph payload hash.
+- **Reveal TX** — Second transaction. Spends the commit output, embeds the
+  glyph payload in the scriptSig, and produces the final singleton-ref NFT
+  output.
+- **Singleton ref** — A 36-byte reference (commit_txid_reversed + commit_vout_LE)
+  pushed by `OP_PUSHINPUTREFSINGLETON` (opcode `0xd8`). Enforces uniqueness —
+  the same ref can never appear in two different outputs.
+- **`nftCommitScript`** — The custom locking script on the commit output.
+  Encodes the hash of the CBOR payload; the reveal tx must present a payload
+  that hashes to the same value.
+- **`"gly"` marker** — The three ASCII bytes `676c79` that prefix every glyph
+  payload in a scriptSig. Used by wallets and explorers to detect Glyph NFTs.
+- **Container / Author ref** — Optional 36-byte refs in the payload's `in` /
+  `by` fields that group NFTs into collections and attribute authorship. Must
+  be **extracted from the singleton output script** of the referenced NFT, not
+  derived from its txid. See the Container and Author Refs section.
+- **CBOR** — Concise Binary Object Representation (RFC 8949). The binary
+  encoding used for Glyph payloads. Every wallet expects CBOR; JSON won't parse.
+- **`main` field** — The on-chain thumbnail embedded in the CBOR payload.
+  Wallet displays come from here, not from IPFS. Without it, your NFT is
+  invisible in Glyphium.
+- **`destAddress`** — The address the reveal tx sends the NFT output to. May
+  differ from the commit address — typical pattern is commit = platform
+  wallet, destAddress = player wallet.
+- **Photonic Wallet / radiantjs** — The canonical browser wallet for Radiant
+  and its underlying JS library. This guide uses radiantjs (via
+  `require('@radiantblockchain/radiantjs')`) as the server-side signer.
+- **Glyphium / Glyph Explorer** — Community wallets and block explorers that
+  render Glyph-protocol NFTs. `https://glyph-explorer.rxd-radiant.com` is the
+  usual explorer URL.
+- **Block heights that matter.** V2 activated at **410,000**; the grace period
+  for the new fee floor ended at **415,000**. Mainnet has been past both since
+  early 2026.
+
 ---
 
 ## Critical Requirements (Read First!)
@@ -145,22 +187,66 @@ WRONG:   d824<ref>7576a914...  // The 24 breaks it
 
 ### Software Requirements
 
-1. **Radiant Node** (v2.1.0+) - Running with RPC access. V2 activates at block 410,000.
+1. **Radiant Node** (v2.3.0 or newer, wallet-enabled build).
+
+   The wallet-capability story is not obvious from release titles:
+   - **v2.1.2**: prebuilt linux-x64 tarballs on GitHub releases are actually ARM64
+     binaries mislabeled as x64. On an Intel/AMD host you'll hit "Exec format error".
+     Build from source or upgrade.
+   - **v2.2.0**: prebuilt linux-x64 runs on x86_64 but **ships without wallet support**
+     compiled in. `listwallets`, `listunspent`, `dumpprivkey`, and
+     `signrawtransactionwithwallet` all return `-32601 Method not found`. Every
+     minting flow in this guide depends on wallet RPCs, so v2.2.0 is unusable here.
+   - **v2.3.0+**: prebuilt linux-x64, wallet-enabled. This is the first release
+     the guide's examples have been verified against.
+
+   Verify your binary actually has the wallet before proceeding:
    ```bash
-   # Docker example
+   # If this returns an array (possibly containing ""), you have wallet support.
+   # If it returns error code -32601, you're on a node-only build — upgrade.
+   radiant-cli -datadir=/home/radiant/.radiant listwallets
+   ```
+
+   Docker: avoid `:latest`, pin the version, and rebuild with `--no-cache` on
+   version bumps (Docker layer caching will happily serve an old binary otherwise).
+   ```bash
+   # Example — rebuild explicitly from a v2.3.0 Dockerfile against the official tarball
+   docker build --no-cache -t radiant-core:2.3.0 -f Dockerfile.mainnet.v2 .
    docker run -d --name radiant-node \
-     -p 7332:7332 \
-     radiantblockchain/radiant:latest
+     -p 127.0.0.1:7332:7332 \
+     -p 7333:7333 \
+     -v radiant-data:/home/radiant/.radiant \
+     radiant-core:2.3.0
    ```
 
-2. **Node.js** - v18+ for signing scripts
+   **Bind RPC to `127.0.0.1:` on the host.** The P2P port 7333 is the only port
+   that should face the public internet. See "Networking the Node" below for the
+   matching `radiant.conf` settings when the node and your PHP backend run in
+   separate Docker containers.
+
+2. **Node.js** - v20+ for signing scripts (v18 EOL, v24 works for our needs).
    ```bash
-   node --version  # Should be 18.0.0 or higher
+   node --version  # Should be 20.x or higher
    ```
 
-3. **radiantjs Library** - For transaction signing
+3. **radiantjs Library** - For transaction signing.
+
+   `@radiantblockchain/radiantjs` is **not published on the npm registry.**
+   Install the `chainbow` fork from GitHub:
    ```bash
-   npm install @radiantblockchain/radiantjs
+   npm install github:chainbow/radiantjs
+   ```
+
+   npm installs the package using its `package.json`-declared name, so even though
+   the dependency key is `radiantjs`, the tree lands at
+   `node_modules/@radiantblockchain/radiantjs/`. That's why the signing script
+   uses `require('@radiantblockchain/radiantjs')`, not `require('radiantjs')`.
+
+   In a `package.json`:
+   ```json
+   "dependencies": {
+     "radiantjs": "github:chainbow/radiantjs"
+   }
    ```
 
 4. **CBOR Library** - For metadata encoding
@@ -174,6 +260,20 @@ WRONG:   d824<ref>7576a914...  // The 24 breaks it
    ```bash
    curl -o js/cbor.min.js "https://raw.githubusercontent.com/paroga/cbor-js/master/cbor.js"
    ```
+
+   > ⚠️  **Pin a version you've reviewed.** Fetching from `master` at build time
+   > is a supply-chain hazard — a repo takeover or network MITM can swap the CBOR
+   > library and silently corrupt every glyph payload you mint. Either:
+   > - Vendor the file into your repo and commit a SHA256-pinned copy, or
+   > - Use an `<script integrity="sha384-...">` subresource-integrity tag when
+   >   loading from a CDN.
+   >
+   > Be aware also of **Cloudflare / CDN caching** on unversioned JS/CSS. If your
+   > nginx sends `Cache-Control: public, immutable` with a 7-day expiry, CDNs
+   > will hold the stale file for a week — code fixes won't reach users. For
+   > unversioned JS/CSS, use short TTL + `must-revalidate`, or embed a version
+   > query string / content hash in the filename. Reserve `immutable` for
+   > content-addressed assets.
 
    **Load in HTML (BEFORE blockchain scripts):**
    ```html
@@ -195,6 +295,245 @@ WRONG:   d824<ref>7576a914...  // The 24 breaks it
 - Familiarity with hex encoding and byte manipulation
 - JavaScript or PHP programming
 - Understanding of public/private key cryptography
+
+---
+
+## Infrastructure Setup
+
+Most of the real pain in getting a Glyph NFT to mint comes from infrastructure,
+not protocol — missing wallet RPCs on the node, the web container not being able
+to reach the node, Node.js not being installed where your signing script runs,
+deploy pipelines that drop `node_modules` on the floor. These three sections
+walk through the setup that the example code later in this guide assumes.
+
+### Getting a Working Radiant Node
+
+**1. Version & wallet verification.** See the Prerequisites note on the v2.1.2 /
+v2.2.0 / v2.3.0 landmines. After your container starts, run:
+
+```bash
+docker exec radiant-node radiant-cli -datadir=/home/radiant/.radiant listwallets
+# Expected: ["") or a list of loaded wallets.
+# If you get error code -32601 "Method not found", your binary is node-only.
+# Rebuild from a v2.3.0 wallet-enabled source.
+```
+
+If you built the image from source, confirm the wallet compiled in:
+
+```bash
+docker run --rm --entrypoint=sh <image> -c 'strings /usr/local/bin/radiantd | grep -iE "^listunspent$"'
+# Should print: listunspent
+```
+
+**2. Protect `wallet.dat` at upgrade time.** The wallet lives in your node's
+datadir volume — e.g. `/home/radiant/.radiant/wallet.dat` inside the container.
+Persisting the volume is necessary but **not sufficient** across version jumps:
+
+- A node-only binary leaves `wallet.dat` untouched (no wallet code = nothing
+  that would touch the file).
+- A wallet-enabled binary loaded against an older or unexpected wallet format
+  can auto-initialize a fresh `wallet.dat` at startup, silently hiding the
+  original behind a blank keypool. The symptom is `getaddressinfo <addr>`
+  returning `ismine: false` for an address you know you funded.
+
+**Always copy `wallet.dat` out before upgrading or rebuilding the image.**
+
+```bash
+# Before the upgrade
+docker cp radiant-node:/home/radiant/.radiant/wallet.dat ./wallet.dat.backup.$(date +%Y%m%d-%H%M%S)
+sha256sum ./wallet.dat.backup.*
+
+# If the post-upgrade wallet looks blank, stop the container, swap the backup
+# into the volume, and restart:
+docker stop radiant-node
+cp ./wallet.dat.backup.<timestamp> \
+   /var/lib/docker/volumes/<your-volume>/_data/wallet.dat
+chmod 600 /var/lib/docker/volumes/<your-volume>/_data/wallet.dat
+docker start radiant-node
+```
+
+After the upgrade, verify the expected address is still yours:
+
+```bash
+docker exec radiant-node radiant-cli -datadir=/home/radiant/.radiant \
+  getaddressinfo <your-hot-wallet-address>
+# Expect: "ismine": true, "iswatchonly": false
+
+docker exec radiant-node radiant-cli -datadir=/home/radiant/.radiant \
+  listunspent 0 9999999 '["<your-hot-wallet-address>"]' | head -20
+```
+
+**3. Rebuild with `--no-cache` on version bumps.** Docker's layer cache will
+happily reuse an old binary layer even when the Dockerfile now points to a new
+release. A rebuild that appears to succeed can silently keep you on the
+wallet-less v2.2.0 binary. Always:
+
+```bash
+docker build --no-cache -f Dockerfile.mainnet.v2 -t radiant-core:2.3.0 .
+```
+
+…and re-check `radiant-cli --version` inside the running container to confirm.
+
+### Networking the Node
+
+If the node and your PHP backend run in the **same** container (unusual), you
+can leave `rpcbind=127.0.0.1`. Everywhere else — separate containers, or
+containers on separate Docker networks — that default breaks RPC access silently.
+
+**In `radiant.conf`:**
+
+```ini
+# Bind to all interfaces so containers on the same Docker network can reach us.
+rpcbind=0.0.0.0
+
+# Restrict who's allowed to talk to RPC. The CIDR below covers the standard
+# Docker bridge ranges; tighten to your actual network if you know it.
+rpcallowip=127.0.0.1
+rpcallowip=172.16.0.0/12
+
+# Standard RPC auth — override these in an environment file, not in-repo.
+rpcuser=flipperchain
+rpcpassword=CHANGE_ME_IN_YOUR_ENV_FILE
+```
+
+**On the host, never bind RPC to `0.0.0.0:7332`.** An exposed RPC port + weak
+password = drained wallet:
+
+```yaml
+# docker-compose.yml — correct
+ports:
+  - "127.0.0.1:7332:7332"   # RPC — host-local only
+  - "7333:7333"              # P2P — public is fine
+  - "127.0.0.1:9100:9100"    # Prometheus metrics — host-local
+```
+
+**Connecting from another container.** If your PHP backend lives in a separate
+compose file / network, attach the Radiant container to that network with an
+alias so app code can use a stable hostname:
+
+```bash
+docker network connect --alias radiant-rpc <app-network> radiant-node
+```
+
+Then in your app's env: `RADIANT_RPC_HOST=radiant-rpc`. DNS resolves to the
+container's IP on the shared network; `rpcallowip=172.16.0.0/12` covers both
+sides of the bridge.
+
+### Calling the Signer from PHP
+
+The Signing Challenge section later in this guide shows a Node.js script
+(`scripts/sign_reveal.js`) that builds and signs the reveal transaction. It has
+to be a subprocess because PHP's wallet RPCs can't sign the non-standard
+`nftCommitScript`. Getting PHP to actually *invoke* it reliably in a Dockerized
+deployment has a few sharp edges.
+
+**1. Node.js has to be inside the web container.** The default
+`php:8.2-fpm-alpine` image does not include Node. `sh: node: not found` is the
+symptom. In your Dockerfile:
+
+```dockerfile
+RUN apk add --no-cache nodejs npm git
+```
+
+**2. Install signing deps OUTSIDE the volume mount.** If your `scripts/`
+directory is bind-mounted from the host (common for rapid iteration), any
+`node_modules` you install at `/var/www/html/your-app/scripts/node_modules`
+gets *hidden* by the mount the moment the container starts. Install at an
+image-local path and expose via `NODE_PATH`:
+
+```dockerfile
+RUN mkdir -p /opt/signing-deps && cd /opt/signing-deps && \
+    echo '{"name":"signing","version":"1.0.0","dependencies":{"radiantjs":"github:chainbow/radiantjs"}}' > package.json && \
+    npm install --omit=dev && \
+    mkdir -p node_modules/@radiantblockchain && \
+    ln -sfn ../radiantjs node_modules/@radiantblockchain/radiantjs
+
+ENV NODE_PATH=/opt/signing-deps/node_modules
+```
+
+The symlink exists because npm installs the package using its declared name
+(`radiantjs` top-level, despite the package's own `package.json` declaring
+`@radiantblockchain/radiantjs`). The signing script requires the scoped path;
+the symlink makes both resolve.
+
+Also check your deploy pipeline: `rsync --exclude node_modules/` matches
+*every* `node_modules` directory, so scripts-level deps never reach the server
+that way. Either allow-list the specific path or install inside the image at
+build time as above.
+
+**3. `proc_close()` can lie about exit codes.** When PHP shells out to Node and
+polls `proc_get_status()` in a loop to detect completion, `proc_get_status()`
+reaps the process and consumes the exit code. The subsequent `proc_close()`
+then returns `-1` forever, so code that does `success = ($returnCode === 0)`
+treats every call as failed — even when Node exited 0 with a valid signed
+transaction in stdout.
+
+**Correct pattern**: capture the exit code the moment the status transitions
+to `running=false`, and fall back to that if `proc_close()` returns `-1`.
+Additionally, trust the parsed stdout JSON when it's well-formed — the signed
+transaction itself is the artifact you care about, and the blockchain will
+reject it if it's malformed regardless of any process exit code:
+
+```php
+function signRevealViaNode(array $params, string $scriptPath): array {
+    $descriptors = [0 => ['pipe', 'r'], 1 => ['pipe', 'w'], 2 => ['pipe', 'w']];
+    $proc = proc_open(['node', $scriptPath], $descriptors, $pipes);
+    if (!is_resource($proc)) {
+        throw new RuntimeException('failed to spawn node');
+    }
+
+    fwrite($pipes[0], json_encode($params));
+    fclose($pipes[0]);
+
+    $stdout = '';
+    $stderr = '';
+    $capturedExitCode = null;
+    stream_set_blocking($pipes[1], false);
+    stream_set_blocking($pipes[2], false);
+
+    $start = time();
+    while (time() - $start < 60) {
+        $status = proc_get_status($proc);
+        $stdout .= (string) stream_get_contents($pipes[1]);
+        $stderr .= (string) stream_get_contents($pipes[2]);
+        if (!$status['running']) {
+            $capturedExitCode = $status['exitcode']; // capture BEFORE proc_close
+            break;
+        }
+        usleep(50_000);
+    }
+    $stdout .= (string) stream_get_contents($pipes[1]);
+    $stderr .= (string) stream_get_contents($pipes[2]);
+    fclose($pipes[1]);
+    fclose($pipes[2]);
+
+    $closeCode = proc_close($proc);
+    $exit = ($closeCode === -1 && $capturedExitCode !== null)
+        ? $capturedExitCode
+        : $closeCode;
+
+    // Trust parsed JSON over exit code — the signed tx is the binding artifact.
+    $parsed = json_decode($stdout, true);
+    if (is_array($parsed) && !empty($parsed['success']) && !empty($parsed['signedTx'])) {
+        return $parsed;
+    }
+
+    throw new RuntimeException("sign failed (exit=$exit): $stderr");
+}
+```
+
+**4. Pass WIF via stdin JSON, never argv or env.** argv is visible in
+`/proc/<pid>/cmdline`, env is visible in `/proc/<pid>/environ`. The stdin pipe
+is the only channel that doesn't leave the key in the process table.
+
+**5. RPC creds never touch the browser.** Wrap every blockchain call behind a
+PHP endpoint that:
+- Authenticates the caller (session cookie + CSRF token for state-changing calls)
+- Rate-limits by IP and by session
+- Allow-lists *which* RPC methods are callable. `dumpprivkey`, `dumpwallet`,
+  `walletpassphrase`, `sendtoaddress`, and related privileged methods must
+  never be reachable from a browser-initiated request, ever. A single
+  mis-routed `dumpprivkey` call drains the wallet in one request.
 
 ---
 
@@ -875,15 +1214,25 @@ $feeSats = $txSize * $feeRate;
 
 ### Real-World Cost Examples
 
-Based on verified mainnet transactions (January 2026):
+Observed on mainnet April 2026 minting a singleton-ref NFT with a small photo
+payload through the commit/reveal path documented in this guide:
 
 | Component | Size | Pre-V2 Cost | Post-V2 Cost (10x) |
 |-----------|------|-------------|---------------------|
-| Commit TX (base) | ~300 bytes | ~0.003 RXD | ~0.03 RXD |
-| Reveal TX (base) | ~250 bytes | ~0.0025 RXD | ~0.025 RXD |
+| Commit TX (observed) | ~276 bytes | ~0.003 RXD | ~0.028 RXD |
+| Reveal TX (observed, ~640-byte glyph payload) | ~1,038 bytes | ~0.010 RXD | ~0.104 RXD |
 | Thumbnail (150px, 65%) | ~6,000 bytes | ~0.06 RXD | ~0.6 RXD |
 | Thumbnail (200px, 70%) | ~15,000 bytes | ~0.15 RXD | ~1.5 RXD |
 | CBOR metadata | ~200-500 bytes | ~0.002-0.005 RXD | ~0.02-0.05 RXD |
+
+A typical reveal is ~1 KB even with a small glyph — scriptSig carries signature +
+pubkey + `"gly"` marker + CBOR body. Larger thumbnails push reveal size past 15 KB
+quickly; plan for 0.5–2 RXD per NFT in real minting costs at post-V2 rates.
+
+**Commit-amount sizing.** The commit transaction's output value must cover the
+reveal transaction's fee **plus** the NFT output value (typically 10,000 photons
+for the singleton dust). Observed: commit amount ≈ 10,400,000 photons to cover a
+reveal at ~10,380,000 photons plus 10,000 photons NFT output.
 
 **Total Cost Formula:**
 ```
@@ -917,6 +1266,15 @@ Use IPFS for full-resolution images while keeping on-chain thumbnails small:
 - **IPFS (`loc` field):** Full-resolution original
 
 ### Server-Side IPFS Upload (Pinata)
+
+> ⚠️  **Secrets hygiene.** A Pinata JWT grants full account control (pin,
+> unpin, billing). Treat it like a password. Keep real secrets in a local
+> `.env` file, **add `.env` to `.gitignore`**, and commit a `.env.example`
+> with placeholders so contributors know which keys to set. This applies to
+> the Pinata JWT, your Radiant RPC password, any AI provider keys, and
+> anything else `getenv()` reads. Public-repo secret leaks are the
+> single most common way people burn themselves on projects built from
+> guides like this one.
 
 ```php
 function uploadFileToPinata($fileData, $filename, $mimeType = 'image/jpeg') {
@@ -968,16 +1326,127 @@ function uploadFileToPinata($fileData, $filename, $mimeType = 'image/jpeg') {
 
 **Problem:** "SSL certificate problem: unable to get local issuer certificate"
 
-**Development Fix:** Add to `.env`:
+**Development-only workaround** (never ship this):
 ```bash
+# In .env — DEVELOPMENT ONLY. Disables TLS verification for the Pinata curl handle.
 IPFS_SKIP_SSL_VERIFY=true
 ```
 
-**Production:** Configure proper CA bundle path in `curl.cainfo` php.ini setting.
+> ⚠️  **Never set this in production.** Disabling TLS verification lets an
+> active network attacker (hotel/cafe wifi, corporate MITM proxy, compromised
+> upstream) substitute the IPFS CID in Pinata's response. You then mint an NFT
+> pointing at the attacker's content instead of yours — permanent and visible
+> on chain. Fix the CA bundle instead.
+
+**Production:** Configure proper CA bundle path in `curl.cainfo` php.ini
+setting, or install `ca-certificates` in your container image so system roots
+are present.
 
 ---
 
 ## Common Errors & Solutions
+
+### Environment & Infrastructure
+
+These are the errors you hit *before* any protocol-level problem, and they
+account for the majority of time lost setting up a minting pipeline for the
+first time.
+
+#### `sh: node: not found` (from PHP)
+
+**Cause:** The web container doesn't have Node.js installed, but your PHP code
+is trying to shell out to `node scripts/sign_reveal.js`.
+
+**Fix:** Install Node in the Dockerfile. See Infrastructure Setup → Calling the
+Signer from PHP.
+
+#### `Method not found` (code -32601) for `listunspent` / `dumpprivkey` / `signrawtransactionwithwallet`
+
+**Cause:** Your Radiant daemon was built without wallet support. v2.2.0 prebuilt
+tarballs ship node-only; v2.1.2 tarballs are mislabeled ARM64.
+
+**Fix:** Upgrade to a wallet-enabled build (v2.3.0+). Verify with
+`docker exec radiant-node radiant-cli -datadir=/home/radiant/.radiant listwallets`.
+Remember `--no-cache` on the rebuild, and **back up `wallet.dat` first**.
+
+#### `Cannot find module '@radiantblockchain/radiantjs'` (from Node)
+
+**Cause:** radiantjs isn't installed, or is installed at the wrong path (npm put
+it at `node_modules/radiantjs/` because that's the dep key you used).
+
+**Fix:** Either install with `npm install github:chainbow/radiantjs` and accept
+npm's placement, or add a symlink:
+
+```bash
+mkdir -p node_modules/@radiantblockchain
+ln -sfn ../radiantjs node_modules/@radiantblockchain/radiantjs
+```
+
+If your deps live at `/opt/signing-deps/node_modules`, set
+`NODE_PATH=/opt/signing-deps/node_modules` so the lookup walks there.
+
+#### "Node.js signing failed" with a valid `{"success":true,"signedTx":…}` in the message
+
+**Cause:** PHP's `proc_close()` returns -1 because `proc_get_status()` already
+reaped the child. The signed transaction in stdout is *correct*; the exit code
+is bogus.
+
+**Fix:** Capture the exit code from `proc_get_status()['exitcode']` at the
+moment `running=false`, and parse stdout JSON before falling back to the exit
+code. See Infrastructure Setup → Calling the Signer from PHP for a reference
+implementation.
+
+#### Web container can't reach the Radiant node ("Connection refused" / DNS fails)
+
+**Cause:** Containers are on separate Docker networks, or `rpcbind=127.0.0.1`
+in `radiant.conf` restricts the daemon to in-container loopback.
+
+**Fix:** Set `rpcbind=0.0.0.0` + `rpcallowip=172.16.0.0/12` in `radiant.conf`,
+bind host ports to `127.0.0.1:`, and attach both containers to the same Docker
+network. See Infrastructure Setup → Networking the Node.
+
+#### `ERROR: must be owner of table` during a DB migration
+
+**Cause:** Running `ALTER TABLE` as the app user; Postgres requires table owner
+(typically the `postgres` superuser) for schema changes.
+
+**Fix:** Run migrations with `-U postgres`, not `-U <app_user>`. Always migrate
+the database *before* deploying code that uses new columns, or every write
+hits a 500.
+
+#### Stale JS served to users after deploy
+
+**Cause:** CDN (usually Cloudflare) is holding the unversioned JS/CSS file
+because your nginx sent `Cache-Control: public, immutable; expires 7d`.
+
+**Fix:** Change the nginx rule for JS/CSS to a short TTL with revalidation, and
+purge the CDN cache to evict the already-poisoned entries:
+
+```nginx
+# Short-cache unversioned JS/CSS — lets deploys reach users within minutes.
+location ~* \.(css|js)$ {
+    expires 5m;
+    add_header Cache-Control "public, max-age=300, must-revalidate";
+}
+# Keep `immutable` for content-addressed assets only.
+location ~* \.(svg|png|jpg|jpeg|gif|ico|woff|woff2|ttf|eot)$ {
+    expires 7d;
+    add_header Cache-Control "public, immutable";
+}
+```
+
+#### CORS-blocked image fetch from an IPFS/R2 gateway
+
+**Cause:** CDN cache was populated by a non-browser fetch with no `Origin`
+header, so the cached response has no `Access-Control-Allow-Origin`. All
+subsequent browser `fetch()` calls hit the same poisoned entry.
+
+**Fix:** Add a per-request cachebuster on the authoritative fetch
+(`?_cb=<timestamp>`), then purge the CDN cache once to evict the poisoned
+response. Your origin (R2, Pinata, etc.) should have CORS configured correctly;
+the problem is almost always the intermediate CDN layer.
+
+### Protocol Errors
 
 ### "NFT shows as blank card in wallet"
 
@@ -1023,18 +1492,27 @@ const commitResult = await createCommitTransaction(feeRate, glyphHex);
 
 **Fix:** Use external signing with Node.js and radiantjs (see Signing Challenge section).
 
-### "min relay fee not met"
+### "min relay fee not met (code 66)"
 
-**Cause:** Fee calculation error.
+**Cause:** Transaction fee is below Radiant's enforced minimum relay fee.
 
-**Fix:**
+**Fix (post-V2 mainnet, block ≥ 415,000):**
 ```php
-// Radiant uses 1000 photons/byte (NOT photons/kB)
-// Post-block 415,000: 10,000 photons/byte (10x increase)
-// Pre-V2: 1000, Post-block 415,000: 10000
-$minRate = 1000; // Update to 10000 after block 415,000
-$feeSats = $txSize * $minRate * 1.5;  // photons, with safety margin
+// Radiant Core 2 enforces a minimum relay fee of 0.1 RXD/kB = 10,000 photons/byte.
+// This is fully in effect from block 415,000 onward; between 410,000 and 415,000
+// miners ran in a grace window that capped policy at the legacy 0.01 RXD/kB floor.
+$minRate = 10000;                       // photons/byte (post-V2 minimum)
+$feeSats = $txSize * $minRate * 1.5;    // photons, with safety margin
 ```
+
+If you're building against a chain before block 415,000 (e.g. regtest or a custom network that hasn't grace-graduated), you can use `getblockcount` to pick the right floor:
+
+```php
+$h = $rpc->call('getblockcount');
+$minRate = ($h < 415000) ? 1000 : 10000; // legacy floor before grace ends
+```
+
+Mainnet has been past 415,000 since early 2026; production code should default to 10,000.
 
 ### "reference-operations" error
 
@@ -1052,15 +1530,9 @@ $feeSats = $txSize * $minRate * 1.5;  // photons, with safety margin
 
 ### "SSL certificate problem" (IPFS upload)
 
-**Cause:** Missing or misconfigured CA certificates.
-
-**Development Fix:**
-```bash
-# In .env
-IPFS_SKIP_SSL_VERIFY=true
-```
-
-**Production Fix:** Configure proper SSL certificates in PHP.
+See the full discussion in "IPFS Integration → SSL Certificate Issues" above —
+including the warning about why you must not ship with `IPFS_SKIP_SSL_VERIFY=true`
+enabled.
 
 ### "Child NFTs don't appear in container" (Glyphium/Explorers)
 
@@ -1432,15 +1904,40 @@ Before any blockchain operation:
 
 ## What's New in V2
 
-> These features have not been extensively tested by the authors of this guide. The information below is documented from specifications, not from implementation experience.
+> V2 is live on mainnet. This section has been updated against a running Radiant
+> Core v2.3.0 node (tip beyond 420,000) and verified against the consensus
+> parameters in `src/chainparams.cpp`, `src/policy/policy.h`, and
+> `src/script/script.h`.
 
 ### V2 Activation (Block 410,000)
 
-Six new opcodes: BLAKE3, K12, bitwise shifts, 2MUL, 2DIV. These enable dMint mining validation and advanced contracts. See opcode table in Appendix.
+At block 410,000, three things activated simultaneously:
 
-### Fee Increase (Block 415,000)
+- **ASERT difficulty adjustment** — the half-life dropped from 2 days to 12 hours,
+  so block-time variance is tighter. Expect faster recovery from hashrate spikes
+  and drops.
+- **Six new opcodes** — `OP_BLAKE3` (`0xee`), `OP_K12` (`0xef`), `OP_LSHIFT` (`0x98`),
+  `OP_RSHIFT` (`0x99`), `OP_2MUL` (`0x8d`), `OP_2DIV` (`0x8e`). These enable dMint
+  mining validation and advanced script contracts. See Appendix opcode table.
+- **New fee framework** — defined at 410,000 but enforced on a delay (see below).
 
-Minimum relay fee increases 10x from 0.01 RXD/kB to 0.1 RXD/kB after a 5,000-block grace period. See Fee Calculations section for updated cost table.
+### Fee Increase (Block 415,000, after grace)
+
+The minimum relay fee rose 10x from 0.01 RXD/kB (legacy) to **0.1 RXD/kB**
+(10,000 photons/byte), with a maximum block min-fee cap of **0.5 RXD/kB**. Between
+blocks 410,000 and 415,000, miners ran under a 5,000-block (~1 week) grace window
+that kept the effective floor at the legacy rate. From block 415,000 onward, the
+0.1 RXD/kB floor is fully enforced — every transaction you build today must meet
+it or receive `{"code":-26,"message":"min relay fee not met (code 66)"}`.
+
+See Fee Calculations & Cost Analysis for the post-V2 cost tables.
+
+### New Protocols: dMint and WAVE
+
+- **dMint** — Mineable token distribution via PoW. Protocol combination `[1, 4]`. Three active mining algorithms: SHA256D (0), BLAKE3 (1), K12 (2).
+- **WAVE** — On-chain naming system. Protocol 11. Provides human-readable addresses and DNS-like records.
+
+See the [Radiant AI Knowledge Base](https://github.com/Radiant-Core/radiant-mcp-server/blob/master/docs/RADIANT_AI_KNOWLEDGE_BASE.md) for implementation details.
 
 ### New Protocols: dMint and WAVE
 
@@ -1505,7 +2002,7 @@ See [Thumbnail Size vs Cost Tradeoffs](#thumbnail-size-vs-cost-tradeoffs) and [F
 
 ---
 
-**Last Updated:** 2026-03-05
+**Last Updated:** 2026-04-16 — updated against Radiant Core v2.3.0 after a real end-to-end mainnet mint. Added Infrastructure Setup, environment troubleshooting, security hygiene, and glossary sections. Verified fee-activation heights against consensus params in `src/chainparams.cpp` and `src/policy/policy.h`.
 **Based on Verified Mainnet Transactions:**
 - With thumbnail: `27390efab1e3168c05301b18f6cdfd553a6d122a41496d0f5e104e79a918be7e`
 

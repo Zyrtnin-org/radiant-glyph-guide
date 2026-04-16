@@ -658,9 +658,20 @@ console.log('Thumbnail size:', payload.main?.b?.length);
 ### When Transactions Fail
 
 **1. Get the Full Error**
+
+If you're running Radiant inside Docker (the usual case), you need the container
+name and the `-datadir` flag or the CLI won't find the data directory:
+
+```bash
+docker exec radiant-node radiant-cli -datadir=/home/radiant/.radiant \
+  sendrawtransaction "0200000001..."
+# Note exact error message
+```
+
+On a host install the bare form works:
+
 ```bash
 radiant-cli sendrawtransaction "0200000001..."
-# Note exact error message
 ```
 
 **2. Share with Claude**
@@ -712,7 +723,7 @@ Create a minimal NFT to verify:
 After minting:
 1. **Glyph Explorer** - Does metadata show?
 2. **Glyphium Wallet** - Does image display?
-3. **radiant-cli gettxout** - Does UTXO exist?
+3. **`radiant-cli gettxout <txid> <vout>`** - Does UTXO exist? In Docker: `docker exec radiant-node radiant-cli -datadir=/home/radiant/.radiant gettxout <txid> <vout>`
 
 ---
 
@@ -920,7 +931,7 @@ Post in #development with:
 
 ---
 
-**Last Updated:** 2026-03-05
+**Last Updated:** 2026-04-16
 **Author:** Radiant Developer Community
 **License:** MIT - Free to use and share
 
