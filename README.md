@@ -146,9 +146,20 @@ chains before, most will be familiar; a few are Radiant/Glyph-specific.
 - **Glyphium / Glyph Explorer** — Community wallets and block explorers that
   render Glyph-protocol NFTs. `https://glyph-explorer.rxd-radiant.com` is the
   usual explorer URL.
+- **`OP_PUSHINPUTREF` (`0xd0`)** — Creates a non-unique (fungible) token
+  reference. Compare with `OP_PUSHINPUTREFSINGLETON` (`0xd8`) for NFTs.
+  FT holder outputs use `d0`; NFT singleton outputs use `d8`.
+- **`OP_STATESEPARATOR` (`0xbd`)** — Splits a script into prologue and
+  epilogue. During execution it's a NOP (no stack effect), but its position
+  determines the boundary between "what the signer proves" (prologue) and
+  "what the network enforces" (epilogue). Used in every FT holder script.
+- **codeScript / codeScript hash** — The portion of a scriptPubKey after
+  `OP_STATESEPARATOR` (the epilogue). Radiant hashes this portion and uses
+  it to group UTXOs by "token type" for conservation checks. Two UTXOs with
+  the same codeScript hash belong to the same token.
 - **Block heights that matter.** V2 activated at **410,000**; the grace period
-  for the new fee floor ended at **415,000**. Mainnet has been past both since
-  early 2026.
+  for the new fee floor ended at **415,000**. As of April 2026, mainnet is
+  past both heights.
 
 ---
 
@@ -425,7 +436,7 @@ rpcallowip=172.20.0.0/16           # example: tighten to your app network
 #                                  # with only the rpcpassword for auth.
 
 # Standard RPC auth — override these in an environment file, not in-repo.
-rpcuser=flipperchain
+rpcuser=your_rpc_user
 rpcpassword=CHANGE_ME_IN_YOUR_ENV_FILE
 ```
 
@@ -815,13 +826,15 @@ protocol.
 ### FT Holder Template (75 bytes)
 
 Verified against **2,309 FT holder samples across 6 distinct tokens, 500
-mainnet blocks** (tip 420,968 → 420,469). Zero template drift — the 50-byte
-fixed portion is invariant across all tokens observed.
+mainnet blocks** (tip 420,968 → 420,469). Zero template drift — the 14-byte
+opcode/suffix frame (`bd d0 … dec0e9aa76e378e4a269e69d`) is identical across
+every token observed. The 36-byte ref in the middle varies per token (it
+identifies *which* token), but the surrounding structure is invariant.
 
 ```
 Byte layout:
   76 a9 14 <pkh:20> 88 ac    ← standard P2PKH (25 bytes) — spendable portion
-  bd                          ← OP_STATESEPARATOR (runtime NOP, interpreter.cpp:1946)
+  bd                          ← OP_STATESEPARATOR (see note below)
   d0 <ref:36>                 ← OP_PUSHINPUTREF + token's 36-byte ref
   de c0 e9 aa 76 e3 78 e4    ← FT conservation epilogue (12 bytes, invariant)
   a2 69 e6 9d
@@ -829,27 +842,37 @@ Byte layout:
 
 **What the epilogue does** (source: [`interpreter.cpp:2167-2204`](https://github.com/RadiantBlockchain/radiant-node/blob/master/src/script/interpreter.cpp#L2167)):
 
-The 12-byte suffix encodes the FT conservation law using two Radiant-specific
-introspection opcodes:
+The 12-byte suffix encodes the FT conservation law. The two key introspection
+opcodes in the sequence are:
 
 - `e3` = `OP_CODESCRIPTHASHVALUESUM_UTXOS` — sum the photon values of all
   inputs whose `codeScript` hash matches the current script's hash
 - `e4` = `OP_CODESCRIPTHASHVALUESUM_OUTPUTS` — same, for outputs
 
-Together they enforce **Σ input photons ≥ Σ output photons** per codeScript
-hash — tokens cannot be inflated by a normal spend. Only the mint-authority
-script (241 bytes, not documented here) can create new supply.
+The remaining bytes in the epilogue (`de`, `c0`, `aa`, `76`, `78`, `a2`,
+`69`, `9d`) are standard Bitcoin Script opcodes (stack manipulation,
+comparison, hashing) that wire the two sums together into the conservation
+check. A full opcode-by-opcode decode is available in
+[`radiant-ledger-app/docs/solutions/integration-issues/radiant-glyph-ft-template-and-view-only-renderer.md`](https://github.com/Zyrtnin-org/radiant-ledger-app) — for this guide, the important
+takeaway is that together they enforce **Σ input photons ≥ Σ output photons**
+per codeScript hash — tokens cannot be inflated by a normal spend. Only the
+mint-authority script (241 bytes, not documented here) can create new supply.
 
-**`OP_STATESEPARATOR` (`0xbd`)** splits the script into prologue (P2PKH,
-evaluated for signature) and epilogue (FT conservation, evaluated by
-consensus). The scriptSig only needs to satisfy the prologue — which is why
-FT spends use the same `<sig> <pubkey>` as plain P2PKH. Ledger apps handle
-this without modification.
+**`OP_STATESEPARATOR` (`0xbd`)** has consensus-level significance: it splits
+the script into a **prologue** (P2PKH, evaluated against the scriptSig for
+signature verification) and an **epilogue** (FT conservation, evaluated by
+consensus for token-supply invariants). During script *execution*
+([`interpreter.cpp:1946`](https://github.com/RadiantBlockchain/radiant-node/blob/master/src/script/interpreter.cpp#L1946))
+it acts as a NOP — it doesn't push, pop, or branch — but its *position* in
+the script is what determines the boundary between "what the signer proves"
+and "what the network enforces." Don't omit it; don't move it. The scriptSig
+only needs to satisfy the prologue — which is why FT spends use the same
+`<sig> <pubkey>` as plain P2PKH. Ledger apps handle this without modification.
 
 ### FT Token Amount
 
-Token balance = UTXO photon value. There is no separate "amount" field in the
-script or CBOR. To compute a holder's balance for a given token:
+There is no separate "amount" field in the script or CBOR — token balance is
+the UTXO's photon value itself. To compute a holder's balance for a given token:
 
 1. Find all UTXOs matching the 75-byte FT holder template for the token's
    36-byte ref AND the holder's 20-byte pubkeyhash.
@@ -967,7 +990,10 @@ Reference implementation: [`classifier.mjs`](https://github.com/Zyrtnin-org/radi
 
 **Note on `p` array combinations:** `p: [1, 4]` means "this is a Fungible Token deployed
 via dMint." Combinations like `[2, 7]` (NFT that is also a container) are valid. The first
-element is the primary type; subsequent elements are modifiers.
+element is the primary type; subsequent elements are modifiers. `p: [4]` alone (dMint
+without an FT or NFT base type) has not been observed on mainnet — all known dMint
+deployments use `[1, 4]` (FT + dMint). Treat a bare `[4]` as unusual; it may be valid
+per protocol but has no real-world precedent to verify against.
 
 ### Container and Author Refs
 
