@@ -10,6 +10,7 @@ Designed to be used as context for AI coding agents (Claude, Cursor, etc.) — p
 > - **First NFT mint?** → Read sections 2 (Critical Requirements), 4 (On-Chain Images), 6 (CBOR Payload), then 7-9 (Commit/Reveal/Signing)
 > - **Debugging a failed mint?** → Jump to section 12 (Common Errors) and the Appendix (opcodes, hex values)
 > - **Upgrading to V2?** → Read section 15 (What's New in V2) and the Fee Calculations section for updated costs
+> - **Hardware wallet (Ledger) support?** → See [`radiant-ledger-guide`](https://github.com/Zyrtnin-org/radiant-ledger-guide). Minting still requires software signing; receiving + spending Glyph UTXOs works with the community Ledger app
 > - **Using Claude with MCP?** → See [BUILDING_WITH_CLAUDE.md](BUILDING_WITH_CLAUDE.md) for MCP setup and workflow tips
 
 ---
@@ -808,6 +809,19 @@ async function signReveal(params) {
     };
 }
 ```
+
+### Hardware Wallet Support
+
+Glyph **minting** cannot currently be done from a hardware wallet: the reveal transaction's scriptSig (`<glyph_push> <signature> <pubkey>`) is non-standard, and no mainstream hardware wallet supports signing arbitrary script structures. Minting requires software signing via Node.js as shown above.
+
+Glyph **receiving and spending**, however, does work with the community-built Radiant Ledger Nano S Plus app. You can:
+
+- Mint a Glyph with software signing and send the output to a Ledger-derived address (`m/44'/512'/0'/0/x`)
+- Later spend that Glyph UTXO with a Ledger-signed transaction (the unlocking side is standard P2PKH)
+
+See [`radiant-ledger-guide`](https://github.com/Zyrtnin-org/radiant-ledger-guide) for installation, wallet pairing, and the direct-APDU harness needed for spending Glyph UTXOs (Electron Radiant's GUI doesn't yet recognize Glyph-prefixed P2PKH as spendable — see section 6 of that guide).
+
+First Ledger-signed Glyph UTXO spend confirmed on mainnet: [`22d4e0e07200437791b48651125a636b994593b215152241aef7113b24b71da3`](https://explorer.radiantblockchain.org/tx/22d4e0e07200437791b48651125a636b994593b215152241aef7113b24b71da3).
 
 ---
 
