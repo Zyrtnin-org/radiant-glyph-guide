@@ -26,18 +26,22 @@ Designed to be used as context for AI coding agents (Claude, Cursor, etc.) — p
    - [Calling the Signer from PHP](#calling-the-signer-from-php)
 5. [On-Chain Images: The `main` Field](#on-chain-images-the-main-field)
 6. [Architecture](#architecture)
-7. [CBOR Payload Format](#cbor-payload-format)
-8. [Commit Transaction](#commit-transaction)
-9. [Reveal Transaction](#reveal-transaction)
-10. [Signing Challenge](#signing-challenge)
-11. [Fee Calculations & Cost Analysis](#fee-calculations--cost-analysis)
-12. [IPFS Integration](#ipfs-integration)
-13. [Common Errors & Solutions](#common-errors--solutions)
-14. [Complete Implementation Example](#complete-implementation-example)
-15. [Testing & Verification](#testing--verification)
-16. [Security Best Practices](#security-best-practices)
-17. [What's New in V2](#whats-new-in-v2)
-18. [Appendix: Quick Reference](#appendix-quick-reference)
+7. [Fungible Tokens (FTs)](#fungible-tokens-fts--the-other-half-of-glyph)
+   - [NFT vs FT Output Script Comparison](#nft-vs-ft-output-script-comparison)
+   - [FT Holder Template (75 bytes)](#ft-holder-template-75-bytes)
+   - [Wallet Classifier Patterns](#wallet-classifier-patterns)
+8. [CBOR Payload Format](#cbor-payload-format)
+9. [Commit Transaction](#commit-transaction)
+10. [Reveal Transaction](#reveal-transaction)
+11. [Signing Challenge](#signing-challenge)
+12. [Fee Calculations & Cost Analysis](#fee-calculations--cost-analysis)
+13. [IPFS Integration](#ipfs-integration)
+14. [Common Errors & Solutions](#common-errors--solutions)
+15. [Complete Implementation Example](#complete-implementation-example)
+16. [Testing & Verification](#testing--verification)
+17. [Security Best Practices](#security-best-practices)
+18. [What's New in V2](#whats-new-in-v2)
+19. [Appendix: Quick Reference](#appendix-quick-reference)
 
 ---
 
@@ -789,6 +793,138 @@ Ref:         263c6922e5b0bfb29b78e25331823ba0b59924d4da5348b414225b082d40fb6a000
 
 ---
 
+## Fungible Tokens (FTs) — The Other Half of Glyph
+
+The earlier sections focus on NFTs (protocol `p: [2]`), which use the
+`OP_PUSHINPUTREFSINGLETON` (`0xd8`) wrapper around P2PKH. Fungible tokens
+(protocol `p: [1]`) use a **different** wrapper — and understanding both shapes
+is critical for wallets, explorers, and anyone building on top of the Glyph
+protocol.
+
+### NFT vs FT Output Script Comparison
+
+| | NFT (singleton, 63 B) | FT (holder, 75 B) |
+|---|---|---|
+| **Layout** | `d8 <ref36> 75 76a914 <pkh20> 88ac` | `76a914 <pkh20> 88ac bd d0 <ref36> dec0e9aa76e378e4a269e69d` |
+| **P2PKH position** | Suffix (after ref + OP_DROP) | Prefix (before the FT machinery) |
+| **Ref opcode** | `d8` OP_PUSHINPUTREFSINGLETON | `d0` OP_PUSHINPUTREF (non-unique) |
+| **Spend scriptSig** | `<sig> <pubkey>` (identical to P2PKH) | `<sig> <pubkey>` (identical to P2PKH) |
+| **Token amount** | N/A (unique token, not a quantity) | UTXO photon value = token balance. No separate amount field. |
+| **Key separator** | `75` OP_DROP between ref and P2PKH | `bd` OP_STATESEPARATOR between P2PKH and FT conservation |
+
+### FT Holder Template (75 bytes)
+
+Verified against **2,309 FT holder samples across 6 distinct tokens, 500
+mainnet blocks** (tip 420,968 → 420,469). Zero template drift — the 50-byte
+fixed portion is invariant across all tokens observed.
+
+```
+Byte layout:
+  76 a9 14 <pkh:20> 88 ac    ← standard P2PKH (25 bytes) — spendable portion
+  bd                          ← OP_STATESEPARATOR (runtime NOP, interpreter.cpp:1946)
+  d0 <ref:36>                 ← OP_PUSHINPUTREF + token's 36-byte ref
+  de c0 e9 aa 76 e3 78 e4    ← FT conservation epilogue (12 bytes, invariant)
+  a2 69 e6 9d
+```
+
+**What the epilogue does** (source: [`interpreter.cpp:2167-2204`](https://github.com/RadiantBlockchain/radiant-node/blob/master/src/script/interpreter.cpp#L2167)):
+
+The 12-byte suffix encodes the FT conservation law using two Radiant-specific
+introspection opcodes:
+
+- `e3` = `OP_CODESCRIPTHASHVALUESUM_UTXOS` — sum the photon values of all
+  inputs whose `codeScript` hash matches the current script's hash
+- `e4` = `OP_CODESCRIPTHASHVALUESUM_OUTPUTS` — same, for outputs
+
+Together they enforce **Σ input photons ≥ Σ output photons** per codeScript
+hash — tokens cannot be inflated by a normal spend. Only the mint-authority
+script (241 bytes, not documented here) can create new supply.
+
+**`OP_STATESEPARATOR` (`0xbd`)** splits the script into prologue (P2PKH,
+evaluated for signature) and epilogue (FT conservation, evaluated by
+consensus). The scriptSig only needs to satisfy the prologue — which is why
+FT spends use the same `<sig> <pubkey>` as plain P2PKH. Ledger apps handle
+this without modification.
+
+### FT Token Amount
+
+Token balance = UTXO photon value. There is no separate "amount" field in the
+script or CBOR. To compute a holder's balance for a given token:
+
+1. Find all UTXOs matching the 75-byte FT holder template for the token's
+   36-byte ref AND the holder's 20-byte pubkeyhash.
+2. Sum the photon values of those UTXOs.
+
+A holder's total balance can be spread across many UTXOs (similar to RXD coin
+fragmentation). A transfer creates new FT UTXOs at the destination with
+matching conservation — the sum of output values must not exceed the sum of
+input values for that token.
+
+### FT Transactions: The Two-Output Pattern
+
+Every FT transfer (or mint) produces at least two outputs:
+
+| Output | Purpose | Script shape |
+|---|---|---|
+| `vout[0]` | FT control / mint-authority | 241-byte complex script — **NOT wallet-spendable**. Do not attempt to classify as P2PKH or display as a user-owned balance. |
+| `vout[1+]` | FT holder outputs | 75-byte FT holder template (one per recipient) |
+
+The 241-byte control output at `vout[0]` is the mint-authority singleton that
+enforces supply rules. Wallets should skip it — attempting to spend it will fail
+at consensus.
+
+### FT CBOR Metadata
+
+FT reveal transactions embed CBOR metadata using the same extraction pattern
+as NFTs. The `vin[0].scriptSig` contains push elements:
+`<sig> <pubkey> <"gly" 3B marker> <CBOR payload>`.
+
+Example from the **Glyph Protocol token** (mainnet reveal `b965b32d…` at height
+228,604, 65,569-byte payload):
+
+```json
+{
+  "p": [1, 4],
+  "ticker": "GLYPH",
+  "name": "Glyph Protocol",
+  "desc": "The first of its kind",
+  "main": { "t": "image/png", "b": "<65,430-byte PNG>" }
+}
+```
+
+Key differences from NFT CBOR:
+- `p: [1]` or `p: [1, 4]` (FT, or FT + dMint) instead of `p: [2]`
+- `ticker` field — short symbol for the token
+- `desc` instead of `type`/`attrs`
+- `main` can be very large (65 KB+ for a full PNG) — the on-chain image
+  represents the token's brand/logo, not a per-unit photo
+
+### Wallet Classifier Patterns
+
+For wallet developers integrating Glyph support — three regex patterns
+that classify every mainnet-observed spendable script shape. Tested against
+13 golden vectors from real mainnet (2,309 samples, 6 tokens, 500 blocks)
+in [`radiant-ledger-app/view-only-ui/fixtures/classifier-vectors.json`](https://github.com/Zyrtnin-org/radiant-ledger-app).
+
+```
+Plain P2PKH (25B):   ^76a914[0-9a-f]{40}88ac$
+NFT singleton (63B): ^d8[0-9a-f]{72}7576a914[0-9a-f]{40}88ac$
+FT holder (75B):     ^76a914[0-9a-f]{40}88acbdd0[0-9a-f]{72}dec0e9aa76e378e4a269e69d$
+```
+
+On match:
+- Extract the 20-byte `pkh` portion → this is the owning address.
+- For NFT/FT: extract the 36-byte `ref` → this identifies the specific token.
+- Group FT UTXOs by ref to compute per-token balance (sum photon values).
+
+The 241-byte FT control/authority scripts intentionally do NOT match any of
+these patterns — they correctly classify as `unknown` and should not be surfaced
+to users as spendable outputs.
+
+Reference implementation: [`classifier.mjs`](https://github.com/Zyrtnin-org/radiant-ledger-app/blob/main/view-only-ui/classifier.mjs) (pure ES module, 83 lines, no dependencies).
+
+---
+
 ## CBOR Payload Format
 
 ### Glyph Protocol Structure
@@ -815,19 +951,23 @@ Ref:         263c6922e5b0bfb29b78e25331823ba0b59924d4da5348b414225b082d40fb6a000
 
 ### Protocol Identifiers
 
-| Value | Meaning |
-|-------|---------|
-| 1 | Fungible Token (FT) |
-| 2 | Non-Fungible Token (NFT) |
-| 3 | Data Storage (DAT) |
-| 4 | Decentralized Mint (dMint) |
-| 5 | Mutable (MUT) |
-| 6 | Explicit Burn |
-| 7 | Container / Collection (parent-only) |
-| 8 | Encrypted Content |
-| 9 | Timelocked Reveal |
-| 10 | Issuer Authority |
-| 11 | WAVE Naming System |
+| Value | Meaning | Typical `p` array | Notes |
+|-------|---------|-------------------|-------|
+| 1 | Fungible Token (FT) | `[1]` | Token amount = UTXO photon value. No separate amount field. |
+| 2 | Non-Fungible Token (NFT) | `[2]` | Unique via `OP_PUSHINPUTREFSINGLETON` (`0xd8`). |
+| 3 | Data Storage (DAT) | `[3]` | |
+| 4 | Decentralized Mint (dMint) | `[1, 4]` | Combined with FT. Three algorithms: SHA256D (0), BLAKE3 (1), K12 (2). |
+| 5 | Mutable (MUT) | `[5]` | |
+| 6 | Explicit Burn | `[6]` | |
+| 7 | Container / Collection | `[7]` | Parent-only; children reference via `in` field. |
+| 8 | Encrypted Content | `[8]` | |
+| 9 | Timelocked Reveal | `[9]` | |
+| 10 | Issuer Authority | `[10]` | |
+| 11 | WAVE Naming System | `[11]` | On-chain DNS-like records. |
+
+**Note on `p` array combinations:** `p: [1, 4]` means "this is a Fungible Token deployed
+via dMint." Combinations like `[2, 7]` (NFT that is also a container) are valid. The first
+element is the primary type; subsequent elements are modifiers.
 
 ### Container and Author Refs
 
@@ -1373,6 +1513,28 @@ Use IPFS for full-resolution images while keeping on-chain thumbnails small:
 - **On-chain (`main` field):** Small thumbnail for wallet display
 - **IPFS (`loc` field):** Full-resolution original
 
+### CID Validation
+
+> ⚠️  **A single-character CID truncation makes your NFT invisible on every
+> IPFS gateway.** Real-world bug: a minting pipeline generated 58-character
+> mock CIDs (one character short of a valid 59-character CIDv1) when Pinata
+> wasn't configured, and silently embedded them on-chain. Every public
+> gateway (`gateway.pinata.cloud`, `ipfs.io`, `dweb.link`) returned 400/422
+> for the truncated CID — the NFT's `loc` field was permanently broken.
+>
+> Before writing `loc` into CBOR:
+> - Validate CID length: CIDv1 with sha2-256 = 59 chars (`bafybei` + 52
+>   base32). CIDv0 = 46 chars (`Qm` + 44 base58).
+> - Validate CID resolves: `curl -sI https://gateway.pinata.cloud/ipfs/<cid>`
+>   should return HTTP 200.
+> - Never fall back to a mock/fake CID in production. If IPFS upload fails,
+>   throw and surface the error — don't mint with a broken `loc`.
+>
+> The `main` field (on-chain thumbnail) is what wallets actually display.
+> `loc` is the backup pointer. A broken `loc` doesn't make the NFT invisible
+> in Glyphium — a missing `main` does. But a broken `loc` does mean the
+> full-resolution image is unreachable, and once minted, the CID is permanent.
+
 ### Server-Side IPFS Upload (Pinata)
 
 > ⚠️  **Secrets hygiene.** A Pinata JWT grants full account control (pin,
@@ -1566,6 +1728,34 @@ response. Your origin (R2, Pinata, etc.) should have CORS configured correctly;
 the problem is almost always the intermediate CDN layer.
 
 ### Protocol Errors
+
+#### "FT UTXO not recognized by wallet" / FT balance shows as 0
+
+**Cause:** Wallet's script classifier only recognizes plain 25-byte P2PKH. The
+75-byte FT holder template (`76a914 <pkh> 88ac bd d0 <ref> dec0e9aa…`) falls
+through to "unknown script type" and is never associated with the owning
+address.
+
+**Fix:** Add the FT classifier regex to the wallet's script recognizer:
+```
+^76a914[0-9a-f]{40}88acbdd0[0-9a-f]{72}dec0e9aa76e378e4a269e69d$
+```
+On match, extract `pkh` at positions `[6:46]` and `ref` at `[54:126]`. Group FT
+UTXOs by ref and sum photon values for per-token balance. See the "Wallet
+Classifier Patterns" section above + the reference implementation in
+[`classifier.mjs`](https://github.com/Zyrtnin-org/radiant-ledger-app/blob/main/view-only-ui/classifier.mjs).
+
+Same pattern applies to NFT singletons (63 bytes) — see the classifier table.
+
+#### "Trying to spend a 241-byte FT control output — fails at consensus"
+
+**Cause:** The wallet classified the 241-byte FT mint-authority script as a
+spendable output. These are NOT wallet-owned P2PKH outputs — they enforce mint
+rules and cannot be spent with a `<sig> <pubkey>` scriptSig.
+
+**Fix:** Ensure the classifier rejects scripts that don't match the three known
+patterns (P2PKH, NFT singleton, FT holder). The 241-byte control scripts
+correctly fall through to "unknown" in the reference classifier.
 
 #### "NFT shows as blank card in wallet"
 
@@ -2087,7 +2277,11 @@ See the [Radiant AI Knowledge Base](https://github.com/Radiant-Core/radiant-mcp-
 | `c8` | OP_OUTPOINTTXHASH | BCH introspection - input txid |
 | `c9` | OP_OUTPOINTINDEX | BCH introspection - input vout |
 | `da` | OP_REFTYPE_OUTPUT | Check ref type in outputs |
-| `d8` | OP_PUSHINPUTREFSINGLETON | Create singleton ref |
+| `d8` | OP_PUSHINPUTREFSINGLETON | Create singleton ref (NFT) |
+| `d0` | OP_PUSHINPUTREF | Create non-singleton ref (FT) |
+| `bd` | OP_STATESEPARATOR | Split prologue/epilogue (runtime NOP) |
+| `e3` | OP_CODESCRIPTHASHVALUESUM_UTXOS | Sum input photons by codeScript hash (FT conservation) |
+| `e4` | OP_CODESCRIPTHASHVALUESUM_OUTPUTS | Sum output photons by codeScript hash (FT conservation) |
 | `75` | OP_DROP | Remove top stack item |
 | `76` | OP_DUP | Duplicate top stack item |
 | `a9` | OP_HASH160 | RIPEMD160(SHA256(x)) |
