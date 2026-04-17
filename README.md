@@ -2,6 +2,11 @@
 
 **Complete Technical Documentation for Building NFT Applications on Radiant**
 
+> **Guide version:** see the [Changelog](#changelog) at the bottom.
+> **Protocol baseline:** Radiant V2 (block 410,000) + post-V2 fees (block 415,000).
+> **Last on-chain verification:** see the [Verified Working Transactions](#verified-working-transactions-january-2026) section for mainnet txids that back the claims in this document.
+> **Integrity (read BEFORE pasting into an AI agent):** the canonical source is `Zyrtnin-org/radiant-glyph-guide` on GitHub. Before pasting into an agent session that has file-write or network access, clone the repo (`git clone https://github.com/Zyrtnin-org/radiant-glyph-guide`), run `git log --oneline` to see the commit history, and diff the current `README.md` against an earlier commit you recognize (e.g. `git diff <known-good-commit>..HEAD README.md`). A compromised fork or a commit injected by an attacker could add instructions that exfiltrate keys or insert backdoors into signing code — and you will not see the injection just by reading the rendered markdown.
+
 This guide provides everything you need to implement Glyph NFTs on the Radiant blockchain, updated for **V2** (block 410,000+). It includes critical discoveries from real-world implementation, all 11 Glyph protocol types, V2 opcode reference, and updated fee calculations for the post-V2 fee increase.
 
 Designed to be used as context for AI coding agents (Claude, Cursor, etc.) — paste the README into your session and start building. See [BUILDING_WITH_CLAUDE.md](BUILDING_WITH_CLAUDE.md) for MCP server setup and AI-assisted workflow tips.
@@ -43,6 +48,8 @@ Designed to be used as context for AI coding agents (Claude, Cursor, etc.) — p
 17. [Security Best Practices](#security-best-practices)
 18. [What's New in V2](#whats-new-in-v2)
 19. [Appendix: Quick Reference](#appendix-quick-reference)
+20. [Disclaimer & Warranty](#disclaimer--warranty)
+21. [Changelog](#changelog)
 
 ---
 
@@ -206,6 +213,17 @@ WRONG:   d824<ref>7576a914...  // The 24 breaks it
 
 ## Prerequisites
 
+> **Two GitHub orgs host Radiant code.** Both `github.com/RadiantBlockchain/*`
+> and `github.com/Radiant-Core/*` are real and active as of 2026-04. This guide
+> uses specific-path links (e.g. `RadiantBlockchain/radiant-node` for the node
+> itself, `Radiant-Core/radiant-mcp-server` for the MCP server). **Before
+> cloning or installing any dependency this guide links to, verify on
+> [radiantblockchain.org](https://radiantblockchain.org) or in the
+> `#dev` / `#announcements` channels of the Radiant Discord that you are
+> pulling from the intended org** — an attacker forking the less-canonical
+> path could insert compromised builds. Pinning SHAs (as shown below for
+> radiantjs) is the durable defense.
+
 ### Software Requirements
 
 1. **Radiant Node** (v2.3.0 or newer, wallet-enabled build).
@@ -315,10 +333,38 @@ WRONG:   d824<ref>7576a914...  // The 24 breaks it
 
    **For browser/frontend - Download and include in HTML:**
    ```bash
-   curl -o js/cbor.min.js "https://raw.githubusercontent.com/paroga/cbor-js/master/cbor.js"
+   # Pin to a specific 40-char commit SHA from https://github.com/paroga/cbor-js/commits/master
+   # (no release tags exist). Review the diff from whatever commit you pick back
+   # to the oldest commit you trust before vendoring.
+   COMMIT="<40-hex-char-commit-sha>"
+
+   # The `-f` flag makes curl fail loudly on HTTP errors instead of silently
+   # writing the HTML error page as your "CBOR library."
+   curl -fo js/cbor.min.js "https://raw.githubusercontent.com/paroga/cbor-js/${COMMIT}/cbor.js"
+
+   # Record the hash in your deploy manifest, then check it on every deploy:
+   sha256sum js/cbor.min.js
    ```
 
-   > ⚠️  **Pin a version you've reviewed.** Fetching from `master` at build time
+   > **A sha256 check is not a trust anchor on first fetch.** If a MITM poisons
+   > the first download, the hash you record is the attacker's. True integrity
+   > requires either (a) comparing against a hash from an independent channel
+   > (e.g. hash published in a Radiant Discord pinned message + in the guide
+   > maintainer's signed commit), or (b) reviewing the downloaded JS diff
+   > yourself before committing it. Once vendored and committed, subsequent
+   > builds verify against your own record — which is what matters operationally.
+
+   > ⚠️  **Beware of ecosystem drift: multiple CBOR libraries exist.** `paroga/cbor-js`
+   > is the reference implementation this guide recommends. However, some Radiant
+   > projects vendor a **custom minimal CBOR encoder** instead (smaller file size,
+   > subset of RFC 8949). The custom encoder may handle `Uint8Array` vs `Array`
+   > for CBOR major-type-2 byte strings **differently** — which is precisely
+   > the "Uint8Array trap" documented below. If you copy CBOR code from a
+   > different Radiant codebase, diff against `paroga/cbor-js` first or you may
+   > mint permanently broken NFTs on-chain. Record the SHA256 of your chosen
+   > library in your deploy manifest.
+   >
+   > **Pin a version you've reviewed.** Fetching from `master` at build time
    > is a supply-chain hazard — a repo takeover or network MITM can swap the CBOR
    > library and silently corrupt every glyph payload you mint. Either:
    > - Vendor the file into your repo and commit a SHA256-pinned copy, or
@@ -739,7 +785,11 @@ $inSats = array_sum(array_map(function($vin) use ($rpc) {
 }, $decoded['vin']));
 $outSats = array_sum(array_map(fn($o) => intval(round(floatval($o['value']) * 100_000_000)), $decoded['vout']));
 $actualFee = $inSats - $outSats;
-if (abs($actualFee - $expectedFeeSats) > max(1000, $expectedFeeSats * 0.01)) {
+// Zero tolerance: you constructed the tx above, so its fee is deterministic.
+// Any drift means the signer or an intermediary changed the structure. A loose
+// tolerance (`max(1000, fee * 0.01)`) lets a compromised signer skim up to
+// ~0.001 RXD per mint — small per-mint but real money at volume.
+if ($actualFee !== $expectedFeeSats) {
     throw new RuntimeException("fee mismatch: signer used $actualFee, expected $expectedFeeSats");
 }
 ```
@@ -801,6 +851,38 @@ IPFS links in the `loc` field are for **full-resolution backup**, not wallet dis
 > (pinata config, wallet renderer, custom gateway) before the user sees
 > them. `loc_hash` costs ~40 bytes on chain; the integrity guarantee is
 > disproportionate.
+
+**Consumer-side verification** — the whole point of `loc_hash` is that the
+*renderer* checks it. Minimal viewer code (browser-side, matching the
+renderer in `radiant-ledger-app/view-only-ui/`):
+
+```javascript
+async function renderLoc(payload, gatewayUrl) {
+    if (!payload.loc || !payload.loc_hash) {
+        return { ok: false, reason: 'no loc/loc_hash on this NFT — cannot verify' };
+    }
+    const m = /^sha256:([0-9a-f]{64})$/i.exec(payload.loc_hash);
+    if (!m) return { ok: false, reason: 'loc_hash format must be sha256:<64 hex>' };
+    const expected = m[1].toLowerCase();
+
+    const res = await fetch(gatewayUrl);
+    if (!res.ok) return { ok: false, reason: `gateway returned HTTP ${res.status}` };
+    const bytes = new Uint8Array(await res.arrayBuffer());
+    const digest = await crypto.subtle.digest('SHA-256', bytes);
+    const got = Array.from(new Uint8Array(digest))
+        .map(b => b.toString(16).padStart(2, '0')).join('');
+
+    if (got !== expected) {
+        return { ok: false, reason: `hash mismatch: chain says ${expected}, gateway served ${got}` };
+    }
+    return { ok: true, bytes };
+}
+```
+
+Renderers that don't implement this check can still display the NFT — but
+they cannot claim the `loc` content is authentic. If your renderer is
+public-facing, document this contract: "we verify loc_hash when present;
+we render `main.b` (on-chain) always."
 
 ### Thumbnail Size vs Cost Tradeoffs
 
@@ -1102,6 +1184,16 @@ NFT singleton (63B): ^d8[0-9a-f]{72}7576a914[0-9a-f]{40}88ac$
 FT holder (75B):     ^76a914[0-9a-f]{40}88acbdd0[0-9a-f]{72}dec0e9aa76e378e4a269e69d$
 ```
 
+**Cross-language note:** always use whole-string anchoring. Regex flavors differ:
+
+- Python: **`re.fullmatch(pattern, script_hex)`** — do NOT use `re.match` (anchors only to start) or `re.search` (unanchored). Python's `$` matches before a trailing `\n` even in default mode (not only `re.MULTILINE`), so a hex blob with a stray newline appended could sneak garbage past a `re.match(pattern + '$', …)` check.
+- Go: `regexp.MustCompile(pattern).MatchString(script_hex)` — `^` and `$` are ASCII-anchored by default, safe.
+- Rust: `regex::Regex::new(pattern).unwrap().is_match(script_hex)` — whole-string by the anchors, safe.
+- JavaScript: `new RegExp(pattern).test(script_hex)` — `^`/`$` are line anchors only in `m` flag mode; without `m`, they anchor to string boundaries, safe.
+- PHP: `preg_match('/' . $pattern . '/', $hex)` — `$` can match before a trailing newline unless you use the `D` flag: `'/' . $pattern . '/D'`.
+
+Lowercase the input first (`hex.toLowerCase()` / `.lower()`) since the patterns above assume lowercase hex.
+
 On match:
 - Extract the 20-byte `pkh` portion → this is the owning address.
 - For NFT/FT: extract the 36-byte `ref` → this identifies the specific token.
@@ -1152,26 +1244,52 @@ output script given a validated `(pkh, ref)` pair.
 
 ### Glyph Protocol Structure
 
+Fields fall into three requirement tiers that builders must distinguish:
+
+| Tier | Meaning | Consequence of violating |
+|---|---|---|
+| **MUST (consensus)** | Enforced by the Radiant protocol; violating transactions are rejected by validators | Tx doesn't confirm — free to fix |
+| **MUST (wallet consensus)** | Every wallet expects this; violating mints confirm on-chain but won't render anywhere | Tx confirms as malformed — **permanent** |
+| **SHOULD (convention)** | Community convention observed by Glyphium + Glyph Explorer; violations render as a blank card or "Unknown NFT" | Tx confirms but UX is degraded — often recoverable by re-mint |
+
 ```javascript
 {
-    p: [2],                           // Protocol: 2 = NFT (REQUIRED)
-    name: "My NFT #12345",            // Token name (REQUIRED)
-    type: "photo",                    // Type (optional)
-    main: {                           // On-chain image (REQUIRED for display!)
-        t: 'image/webp',              // MIME type (must match thumbnail format)
-        b: thumbnailUint8Array        // Image bytes
+    p: [2],                           // MUST (wallet consensus): protocol selector.
+                                      // 2=NFT, 1=FT, [1,4]=dMint, etc. Wallets
+                                      // reject the whole payload if absent.
+    name: "My NFT #12345",            // SHOULD: display name. Tx is valid without
+                                      // it; wallets fall back to "Unknown NFT".
+    type: "photo",                    // SHOULD: free-form category used by apps.
+    main: {                           // SHOULD but critical: on-chain thumbnail.
+        t: 'image/webp',              //   Without main, every wallet shows a
+        b: thumbnailUint8Array        //   blank card (consistent across wallets).
     },
-    in: [containerRefBytes],          // Container ref (optional)
-    by: [authorRefBytes],             // Author ref (optional)
-    attrs: {                          // Custom attributes (optional)
-        score: 1000000,
+    in: [containerRefBytes],          // SHOULD: container/collection ref.
+    by: [authorRefBytes],             // SHOULD: author/minter ref (provenance).
+    attrs: {                          // SHOULD: app-specific metadata, string-keyed
+        score: 1000000,               //   primitives only (see warning below).
         game: "Game Name",
         player: "Player Name"
     },
-    loc: "ipfs://...",                // IPFS full-res location (optional)
-    loc_hash: "sha256:..."            // Content binding for `loc` (recommended)
+    loc: "ipfs://...",                // SHOULD: IPFS full-res location. Must be
+                                      //   a valid CIDv0 (46 char Qm...) or CIDv1
+                                      //   (59 char bafybei...). Truncated CIDs
+                                      //   mint permanently broken NFTs.
+    loc_hash: "sha256:..."            // SHOULD (security-relevant): binds `loc`
+                                      //   content to on-chain record. Omitting
+                                      //   is valid on-chain but removes the only
+                                      //   integrity guarantee on off-chain content.
+                                      //   For NFTs with value (tickets, scores,
+                                      //   collectibles), treat as MUST: anyone
+                                      //   with pin-service API access can swap
+                                      //   the asset post-mint without `loc_hash`.
 }
 ```
+
+**CBOR encoding itself is MUST (wallet consensus)** — JSON-encoded payloads
+confirm on-chain but show as "Unknown NFT" in every wallet. The commit script
+hashes the CBOR bytes, so the encoder's behavior (e.g. Uint8Array handling,
+see below) is also effectively consensus for your mint.
 
 > **Keep `attrs` to string-keyed primitives.** Viewers and indexers cannot
 > safely render arbitrary CBOR graphs: map keys that aren't strings, nested
@@ -1423,7 +1541,7 @@ OP_DUP OP_HASH160 <20-byte-pubkeyhash> OP_EQUALVERIFY OP_CHECKSIG  // P2PKH
  * worst case it can shift the pubkeyhash portion and direct the NFT to
  * an attacker-chosen address. Validate upstream before calling.
  */
-private function buildNftCommitScript($pubkeyhash, $payloadHash) {
+function buildNftCommitScript($pubkeyhash, $payloadHash) {
     assert(strlen($pubkeyhash) === 40 && ctype_xdigit($pubkeyhash));
     assert(strlen($payloadHash) === 64 && ctype_xdigit($payloadHash));
 
@@ -1917,6 +2035,28 @@ Use IPFS for full-resolution images while keeping on-chain thumbnails small:
 - **On-chain (`main` field):** Small thumbnail for wallet display
 - **IPFS (`loc` field):** Full-resolution original
 
+### Pinning Service Options
+
+The examples below use **Pinata** because it has a stable REST API and a
+reasonable free tier, but the Glyph protocol is pinning-service agnostic —
+the `loc` field only needs a resolvable `ipfs://` URL. Alternatives if you
+want to decouple from a single vendor:
+
+| Service | Notes |
+|---|---|
+| **Pinata** (`api.pinata.cloud`) | Default in examples below. JWT auth, good free tier, dedicated gateways. |
+| **web3.storage / Storacha** | Protocol-Labs-associated. Pivoted to paid "Storacha" tier in 2025; free tier limited/changed. Check current pricing before integrating. |
+| **NFT.Storage** | Formerly free-for-NFTs; 2024 policy change migrated existing free pins to "Classic" tier with read-only access. Check current pricing before integrating. |
+| **Filebase** (`s3.filebase.com`) | S3-compatible API, works with any AWS SDK. Paid, per-GB. |
+| **4EVERLAND** | IPFS + Arweave in one API. Free tier available. |
+| **Self-hosted Kubo node** | Full control; you pay bandwidth + disk. Easiest to lose pins if the node dies. |
+| **Dedicated gateway** | Pinata, Cloudflare, Filebase, and Fleek all offer per-account dedicated gateways that resolve faster and aren't rate-limited. |
+
+Rule of thumb: **pin to at least two independent services** so one vendor
+going down or deprecating an API doesn't silently break your NFTs. Record
+the `loc_hash` binding so you can re-pin from a different service later
+without needing on-chain updates.
+
 ### CID Validation
 
 > ⚠️  **A single-character CID truncation makes your NFT invisible on every
@@ -1991,21 +2131,42 @@ function uploadFileToPinata($fileData, $filename, $mimeType = 'image/jpeg') {
     // so a polluted env cannot redirect renders through an attacker-controlled
     // gateway. Rendering code that trusts gatewayUrl verbatim will fetch
     // content from whatever host is set here.
+    // Cloudflare sunset their public IPFS gateway in 2024 — do not add it back.
     $allowedGateways = [
         'gateway.pinata.cloud',
         'ipfs.io',
         'dweb.link',
-        'cloudflare-ipfs.com',
     ];
     if (!in_array($gateway, $allowedGateways, true)) {
         throw new RuntimeException("PINATA_GATEWAY '{$gateway}' not in allow-list");
     }
 
+    // CRITICAL: validate the CID Pinata returned BEFORE minting it into the
+    // `loc` field. A truncated or malformed CID mints permanently as an
+    // unresolvable NFT (all public gateways return 400/422). Real-world bug
+    // observed at FlipperHub: 58-character CIDv1 (one char short of 59) got
+    // minted and every NFT with that `loc` was invisible in wallets.
+    // Matches sha2-256 CIDv1 (bafybei + 52 base32 chars = 59 total) and CIDv0
+    // (Qm + 44 base58 chars = 46 total). Pinata pins with sha2-256 by default,
+    // so this covers the expected happy path. If you switch hash functions
+    // (e.g. blake3) you will need to widen the regex.
+    // Note the `D` flag: PHP's PCRE `$` matches before a trailing newline by
+    // default, so without `D` a CID with a stray `\n` would pass validation
+    // and be written into `loc` as a broken link. See the Wallet Classifier
+    // section's cross-language regex note for the same pitfall in Python.
+    $cid = $result['IpfsHash'] ?? '';
+    if (!preg_match('/^(bafybei[a-z2-7]{52}|Qm[1-9A-HJ-NP-Za-km-z]{44})$/D', $cid)) {
+        return [
+            'success' => false,
+            'error'   => 'Pinata returned malformed CID (expected 59-char sha2-256 CIDv1 bafybei... or 46-char CIDv0 Qm...): ' . substr($cid, 0, 80)
+        ];
+    }
+
     return [
         'success' => true,
-        'cid' => $result['IpfsHash'],
-        'url' => 'ipfs://' . $result['IpfsHash'],
-        'gatewayUrl' => "https://{$gateway}/ipfs/" . $result['IpfsHash']
+        'cid' => $cid,
+        'url' => 'ipfs://' . $cid,
+        'gatewayUrl' => "https://{$gateway}/ipfs/" . $cid
     ];
 }
 ```
@@ -2787,3 +2948,26 @@ on mainnet, start with values you can afford to lose.
 
 In short: treat this guide as a technical map, not a warranty. The terrain
 is yours to navigate.
+
+---
+
+## Changelog
+
+Radiant's on-chain protocol is versioned by activation height (V2 = block
+410,000, fee change = 415,000, etc.). This guide is versioned independently
+and tracks documentation evolution.
+
+| Date | Commit range | Summary |
+|---|---|---|
+| 2026-04-17 | (this commit) | Added MUST-vs-SHOULD tier table for CBOR fields, cross-language regex note for wallet classifiers, multi-library CBOR ecosystem warning, alternative IPFS provider options, CID validation in `uploadFileToPinata`, Changelog section. |
+| 2026-04-17 | `4a9d87d` | Ultrathink review fixes: tx-output validation gate (integer math), radiantjs SHA pin, Radiant Core tarball verification, PINATA_GATEWAY hostname allow-list, `loc_hash` field, `proc_terminate` fallback on signing timeout, MCP guide WIF hardening. Recovery walkthroughs (regtest funding, failed-reveal recovery). FT ref construction by copy-from-existing-UTXO. Anchored 63-byte NFT regex. CBOR attrs restricted to string-keyed primitives. Disclaimer + Ledger-app unaudited note. |
+| 2026-04-16 | `63da546`, `08d623d`, `b2a496b` | Repo renamed to `radiant-glyph-guide`. Section-numbering fixes, scriptSig order corrections, thumbnail-size tradeoff table. Reviewer fixes: precision language, glossary, PII review, FT epilogue opcode decode. |
+| 2026-04-16 | `2a71304` | Added FT support end-to-end: 75-byte holder template, wallet classifier patterns, `OP_STATESEPARATOR` + conservation epilogue decode against Radiant Core source, CID validation guidance after the 58-char truncation bug. |
+| earlier | — | NFT-only reference, V2 opcode/fee coverage, CBOR payload format, commit/reveal flow, Common Errors catalogue. |
+
+### When to re-verify
+
+- **Radiant Core release**: re-run the Verified Working Transactions section against the new version.
+- **Glyph protocol addition** (new opcode, new protocol ID, new required CBOR field): audit sections 5 (On-Chain Images), 7 (Fungible Tokens), 8 (CBOR Payload Format), 14 (Common Errors).
+- **Pinata/IPFS API change**: audit `uploadFileToPinata` and the IPFS Integration section.
+- **Electron-Wallet / Ledger firmware update**: audit the Hardware Wallet pointer and [`radiant-ledger-guide`](https://github.com/Zyrtnin-org/radiant-ledger-guide) cross-reference.
