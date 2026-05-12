@@ -14,7 +14,7 @@ Designed to be used as context for AI coding agents (Claude, Cursor, etc.) — p
 > **FOR AI AGENTS — Start Here:**
 > - **First NFT mint?** → Read sections 2 (Critical Requirements), 5 (On-Chain Images), 9 (CBOR Payload), then 10-12 (Commit/Reveal/Signing)
 > - **First FT integration?** → Read section 7 (Fungible Tokens) for the 75-byte template + wallet classifier patterns
-> - **First dMint deploy or mint?** → Read [section 8 (Decentralized Mint)](#decentralized-mint-dmint) for the V1 contract layout, deploy commit/reveal shape, and Photonic-master divergences. See also the [byte-decoded GLYPH reference deploy](#verified-working-transactions-january-2026).
+> - **First dMint deploy or mint?** → Read [section 8 (Decentralized Mint)](#decentralized-mint-dmint) for the V1 contract layout, deploy commit/reveal shape, [V1 mint tx mechanics](#v1-mint-tx-mechanics-mainnet-verified) (4-output shape, 72-byte mint scriptSig, PoW preimage layout), and Photonic-master divergences. See also the [byte-decoded GLYPH reference deploy and snk/PXD mint txs](#verified-working-transactions-january-2026).
 > - **Debugging a failed mint?** → Jump to section 15 (Common Errors) and the Appendix (opcodes, hex values)
 > - **Upgrading to V2?** → Read section 19 (What's New in V2) and the Fee Calculations section for updated costs
 > - **Hardware wallet (Ledger) support?** → See [`radiant-ledger-guide`](https://github.com/Zyrtnin-org/radiant-ledger-guide). Minting still requires software signing; receiving + spending Glyph UTXOs works with the community Ledger app
@@ -38,10 +38,15 @@ Designed to be used as context for AI coding agents (Claude, Cursor, etc.) — p
    - [FT Holder Template (75 bytes)](#ft-holder-template-75-bytes)
    - [Wallet Classifier Patterns](#wallet-classifier-patterns)
 8. [Decentralized Mint (dMint)](#decentralized-mint-dmint)
-   - [Commit tx layout (verified GLYPH deploy)](#commit-tx-layout-verified-glyph-deploy)
-   - [Reveal tx layout and heterogeneous inputs](#reveal-tx-layout-and-heterogeneous-inputs)
-   - [V1 vs V2 CBOR distinction](#v1-vs-v2-cbor-distinction)
-   - [Auth NFT: fresh-mint vs forward-prior](#auth-nft-fresh-mint-vs-forward-prior)
+   - [Reference mainnet artifacts](#reference-mainnet-artifacts-use-these-to-test-your-decoder)
+   - [V1 vs V2: critical warning](#v1-vs-v2-critical-warning)
+   - [V1 contract UTXO byte layout (241 B)](#v1-contract-utxo-byte-layout-241-b--state96--epilogue145)
+   - [dMint deploy: commit-tx output shape](#dmint-deploy-commit-tx-output-shape)
+   - [dMint deploy: reveal-tx I/O shape](#dmint-deploy-reveal-tx-io-shape)
+   - [V1 mint tx mechanics (mainnet-verified)](#v1-mint-tx-mechanics-mainnet-verified)
+   - [dMint CBOR token body](#dmint-cbor-token-body-revealed-in-vin0)
+   - [Photonic Wallet divergences](#photonic-wallet-divergences-v1-dmint)
+   - [Finding the deploy reveal from a commit txid](#finding-the-deploy-reveal-from-a-commit-txid-scripthash-history-gotcha)
    - [Known gotchas](#dmint-deploy-known-gotchas)
 9. [CBOR Payload Format](#cbor-payload-format)
 10. [Commit Transaction](#commit-transaction)
@@ -1472,6 +1477,9 @@ There are two on-chain layouts for dMint contracts:
 | Algorithm | byte at offset 19 of epilogue (`0xaa`=SHA256D, `0xee`=BLAKE3, `0xef`=K12) | dedicated state push |
 | DAA | none (FIXED difficulty only) | ASERT / LWMA available |
 | CBOR | `p: [1, 4]`, no `v` field | `v: 1, p: [2, 4]` |
+| Mint scriptSig nonce width | 4 bytes (`0x04` push) | 8 bytes (`0x08` push) |
+| Mint reward output (vout[1]) | **75-byte FT-wrapped** (P2PKH prologue + `bd` + `d0 <tokenRef>` + `dec0e9aa76e378e4a269e69d`) | **byte-identical to V1** — same 75-byte FT-wrapped output, same 12-byte fingerprint |
+| Output-validation epilogue (covenant bytecode) | 107-byte block enforcing the vout[1] reward shape (in pyrxd: `_PART_C`, equal to `_V1_EPILOGUE_SUFFIX[18:]`) | **byte-identical to V1** — the entire 107-byte output-validation block is shared, not just the 12-byte fingerprint |
 
 **Every dMint deploy found on Radiant mainnet to date is V1.** The
 canonical reference is the GLYPH (Glyph Protocol) deploy at:
@@ -1559,6 +1567,139 @@ Two production decisions are open to a builder:
    mint-fresh; see deferred-work note below.
 2. **Premine and delegate-ref**: Photonic supports both; the GLYPH
    deploy uses neither. Both are deferred work for first-cut builders.
+
+### V1 mint tx mechanics (mainnet-verified)
+
+A V1 mint transaction spends one of the N parallel contract UTXOs,
+recreates it with `height` incremented by 1, and pays the miner a
+75-byte FT-wrapped reward. The shape is fixed and the on-chain covenant
+will reject any deviation.
+
+**Mainnet anchors** (byte-decoded; the layout below was verified
+identical against both):
+
+| Token | Mint txid | Notes |
+|---|---|---|
+| snk | `146a4d688ba3fc1ea9588e406cc6104be2c9321738ea093d6db8e1b83581af3c` | block 422,865 (2026-01); documented in `pyrxd/docs/dmint-research-mainnet.md` §4 |
+| PXD | `c9fdcd3488f3e396bec3ce0b766bb8070963e7e75bb513b8820b6663e469e530` | 2026-05-11; independent confirmation at a different timestamp, same I/O shape, same 72-byte mint scriptSig layout. Deploy reveal: `8eeb333943771991c2752abc78038365ecd76b1a24426f7a3212eea71b6a6564`. |
+
+#### Inputs
+
+| vin | spends | role |
+|---|---|---|
+| 0 | the previous contract UTXO (241 B) | scriptSig carries the mint solution — see scriptSig layout below |
+| 1 | a plain-RXD P2PKH the miner controls | funds the reward and tx fee; scriptSig is a standard `<sig> <pubkey>` |
+
+Selecting vin[1] **must** exclude token-bearing UTXOs (any with an
+`OP_PUSHINPUTREF`-family opcode in opcode position). Spending an FT,
+NFT, or another contract UTXO as funding silently destroys the token —
+see the [Token-Burn Defense](#token-burn-defense-coin-selection-must-reject-token-bearing-utxos)
+in §7 and use an opcode-aware walker; a bare-byte scan rejects ~51% of
+honest funding addresses.
+
+#### Outputs (canonical: 4 outputs)
+
+| vout | bytes | value | role |
+|---|---|---|---|
+| 0 | 241 | 1 photon (singleton — must equal previous contract value) | recreated contract; **only byte that differs from previous contract** is the 4-byte LE `height` at offset 1..4 (incremented by 1) |
+| 1 | 75 | `reward` photons (from the contract's state, e.g. 50,000) | FT-wrapped reward to the miner: `OP_DUP OP_HASH160 <miner_pkh> OP_EQUALVERIFY OP_CHECKSIG` `bd` `d0 <tokenRef>` `dec0e9aa76e378e4a269e69d` |
+| 2 | varies | 0 | OP_RETURN per-mint marker (Photonic-Wallet convention): `6a 03 6d7367 <push-len> <msg-bytes>` — `6d7367` is the ASCII bytes for `"msg"` |
+| 3 | 25 | change | plain P2PKH back to the miner |
+
+The reward output (vout[1]) is **not** a plain P2PKH. The V1 covenant
+enforces an FT-wrapped reward via `OP_CODESCRIPTHASHVALUESUM_OUTPUTS
+OP_NUMEQUALVERIFY`; emitting a bare P2PKH at vout[1] produces a
+`mandatory-script-verify-flag-failed` rejection. The 12-byte
+`dec0e9aa76e378e4a269e69d` epilogue is the codescript-hash preimage
+that ties the reward back to the token.
+
+**This same vout[1] output shape applies to V2 mints.** The FT-conservation
+covenant logic — the 75-byte FT-wrapped reward with the
+`dec0e9aa76e378e4a269e69d` codescript-hash fingerprint — is shared between
+V1 and V2; in pyrxd it lives in the `_PART_C` bytecode reused by both
+contract builders. The only V1/V2 difference at the mint-tx level is the
+**scriptSig nonce width** (4 bytes in V1, 8 bytes in V2; see "Mint scriptSig
+layout" below). Any V2 implementation that emits a plain 25-byte P2PKH at
+vout[1] will be rejected by the covenant just as a V1 one would.
+
+The OP_RETURN at vout[2] is convention, not consensus — different
+deployers use different `msg` payloads. The push prefix is always
+`6a 03 6d7367` ("OP_RETURN PUSH(3) 'msg'") followed by a length-prefixed
+message bytes.
+
+#### Mint scriptSig layout (vin[0]) — 72 bytes for V1
+
+```
+<0x04> <nonce:4-LE> <0x20> <inputHash:32> <0x20> <outputHash:32> <0x00>
+```
+
+That is:
+
+- `0x04` — direct PUSH of 4 bytes (V1 nonce width; V2 uses an 8-byte nonce)
+- `nonce` — the value the miner found via Proof-of-Work
+- `0x20` — direct PUSH of 32 bytes
+- `inputHash` — `SHA256d(vin[1].locking_script)`, i.e. the double-SHA256 of the funding input's locking script
+- `0x20` — direct PUSH of 32 bytes
+- `outputHash` — `SHA256d(vout[2].locking_script)`, i.e. the double-SHA256 of the OP_RETURN message script
+- `0x00` — `OP_0`, the empty-bytes terminator that the covenant's `OP_ROLL` drops
+
+Total length: 1+4+1+32+1+32+1 = **72 bytes** exactly. Verified against
+mainnet mint `146a4d68…f3c` vin[0] and our own mint `c9fdcd34…e530` vin[0].
+
+#### PoW preimage layout (V1)
+
+The miner hashes a 64-byte preimage plus the 4-byte nonce to find a
+solution. The preimage halves are constructed as:
+
+```
+preimage[ 0..32] = SHA256(outpointTxHash || contractRef)
+preimage[32..64] = SHA256( SHA256d(input_script) || SHA256d(output_script) )
+PoW_hash         = SHA256d(preimage || nonce)         # nonce is 4 bytes LE for V1
+```
+
+Where:
+
+- `outpointTxHash` is the 32-byte txid (internal/little-endian order) of the previous mint tx (the one whose vout[0] this mint is spending — i.e. the contract UTXO's source txid)
+- `contractRef` is the 36-byte contract ref from the spent UTXO's state (bytes 5..41 of the 241-byte contract script)
+- `input_script` is `vin[1].locking_script` (the funding input)
+- `output_script` is `vout[2].locking_script` (the OP_RETURN message)
+
+The covenant rebuilds the second SHA256 from the `inputHash` and
+`outputHash` pushed in the mint scriptSig, then re-hashes the assembled
+preimage with the pushed nonce to confirm `PoW_hash < target`. If the
+scriptSig pushes diverge from what the miner actually hashed, the
+covenant rejects after a successful mine — see
+`docs/solutions/runtime-errors/dmint-v1-mint-scriptsig-shape.md` in
+pyrxd for the prior incident.
+
+#### pyrxd builder API for V1 mint mechanics
+
+The reference implementation in pyrxd
+(`src/pyrxd/glyph/dmint.py`) exposes the moving parts as:
+
+```python
+from pyrxd.glyph.dmint import build_pow_preimage, build_mint_scriptsig
+
+pow = build_pow_preimage(
+    txid_le=prev_mint_txid_le,        # 32 bytes, internal/little-endian
+    contract_ref_bytes=contract_ref,  # 36 bytes (state bytes 5..41)
+    input_script=funding_utxo_script, # vin[1] locking script
+    output_script=op_return_script,   # vout[2] OP_RETURN message
+)
+# pow is PowPreimageResult(preimage, input_hash, output_hash)
+# - mine over pow.preimage to find a 4-byte nonce hitting the target
+# - then build the scriptSig from the SAME hashes:
+scriptsig = build_mint_scriptsig(
+    nonce, pow.input_hash, pow.output_hash,
+    nonce_width=4,                    # 4 for V1, 8 for V2
+)
+```
+
+Returning the preimage and the two hashes from a single helper is
+deliberate: independently recomputing them on the scriptSig-build side
+is the failure mode that produced the M1 covenant-rejection bug. Treat
+`PowPreimageResult` as the single source of truth for both the mining
+and signing paths.
 
 ### dMint CBOR token body (revealed in vin[0])
 
@@ -1688,19 +1829,21 @@ See also: [§14 Common Errors](#common-errors--solutions) and
    tries V2 first, falls back to V1, and signals which version was matched. (See protocol-review
    for details; compound doc: `dmint-v1-classifier-gap.md`.)
 
-2. **V1 mint reward output is NOT a plain P2PKH.** The V1 covenant requires a 75-byte
+2. **Mint reward output is NOT a plain P2PKH (V1 and V2 both).** The covenant requires a 75-byte
    FT-wrapped reward output (`P2PKH prologue + OP_STATESEPARATOR + OP_PUSHINPUTREF tokenRef +
-   12-byte epilogue`). Plain P2PKH reward outputs will be rejected by the covenant. The contract
-   output value must stay constant (singleton — typically 1 photon); the miner funds the reward
-   and fee from a separate plain-RXD input. (Compound doc: `dmint-v1-mint-shape-mismatch.md`.)
+   12-byte epilogue`). Plain P2PKH reward outputs will be rejected by the covenant. This applies
+   to V1 mints (mainnet-verified against `146a4d68…f3c`) and to V2 mints (the reward-shape covenant
+   logic is shared bytecode between V1 and V2 contracts). The contract output value must stay
+   constant (singleton — typically 1 photon); the miner funds the reward and fee from a separate
+   plain-RXD input. (Compound doc: `dmint-v1-mint-shape-mismatch.md`.)
 
 3. **Bare-byte script classification rejects ~51% of honest miners.** Any check for
    OP_PUSHINPUTREF-family opcodes (`0xd0–0xd8`) that scans the full script byte-by-byte will
    false-positive on P2PKH addresses whose 20-byte hash contains those bytes — a ~51% hit rate
    on random addresses. All script classification must walk the opcode stream, skipping push
-   payloads. (Compound doc: `funding-utxo-byte-scan-dos.md`.)
-
-        This is the defensive code pattern for gotcha 3. -->
+   payloads. (Compound doc: `funding-utxo-byte-scan-dos.md`.) See the
+   [Token-Burn Defense canonical walker](#token-burn-defense-coin-selection-must-reject-token-bearing-utxos)
+   in §7 for the defensive code pattern.
 
 4. **Hashlock reuse confuses scripthash-based "find the reveal" walks.** If the same payload
    hash and owner PKH are used in a failed earlier attempt, ElectrumX `get_history` for that
@@ -2877,7 +3020,8 @@ transaction.
 |------|---------------|-----------------|
 | Glyph NFT reveal w/ on-chain thumbnail | `27390efab1e3168c05301b18f6cdfd553a6d122a41496d0f5e104e79a918be7e` | scriptSig push stack (`<sig> <pubkey> <preimage with gly+CBOR>`) and the 63-byte singleton output |
 | V1 dMint deploy commit + reveal (GLYPH token) | commit `a443d9df469692306f7a2566536b19ed7909d8bf264f5a01f5a9b171c7c3878b` / reveal `b965b32dba8628c339bc39a3369d0c46d645a77828aeb941904c77323bb99dd6` | 75-byte FT-commit hashlock script; 32 × 241-byte V1 contract output scripts |
-| V1 dMint mint-tx reward output (RBG GLYPH) | `146a4d68…f3c` vout[1] (75 bytes: `76 a9 14 <miner_pkh> 88ac bd d0 <token_ref> dec0e9aa76e378e4a269e69d`) | reward-output script byte-equal |
+| V1 dMint mint-tx reward output (snk token, 2026-01) | `146a4d68…f3c` vout[1] (75 bytes: `76 a9 14 <miner_pkh> 88ac bd d0 <token_ref> dec0e9aa76e378e4a269e69d`) | reward-output script byte-equal |
+| V1 dMint mint-tx (PXD token, 2026-05-11) | `c9fdcd3488f3e396bec3ce0b766bb8070963e7e75bb513b8820b6663e469e530` | independent timestamp confirmation: same 4-output mint shape, same 72-byte mint scriptSig, byte-equal `_PART_C` reward bytecode |
 | Live RBG dMint reveal w/ 10 V1 contracts | `c5c296ebff5869c6e2b208ce0cd04be479a9f10d33cf73608f0a5efc2d6b55b6` | classifier coverage on vouts 0–13 (10 dMint, 1 FT, 2 NFT, 1 P2PKH) |
 
 ### Required test pattern
@@ -3398,6 +3542,25 @@ and commit txid. For additional golden-vector txids covering V1 dMint mint and
 classifier coverage on live RBG dMint reveals, see [Validating Your Builder
 Against Mainnet](#validating-your-builder-against-mainnet).
 
+**V1 dMint mint tx (canonical 4-output shape — byte-decoded from chain):**
+- `146a4d688ba3fc1ea9588e406cc6104be2c9321738ea093d6db8e1b83581af3c` — snk
+  token, block 422,865. 2 inputs (contract + funding), 4 outputs (recreated
+  241-byte contract + 75-byte FT reward + OP_RETURN msg marker + change).
+  vin[0] is the canonical 72-byte V1 mint scriptSig
+  (`<0x04 nonce(4)> <0x20 inputHash(32)> <0x20 outputHash(32)> <0x00>`).
+  Full byte-decode: `pyrxd/docs/dmint-research-mainnet.md` §4.
+- `c9fdcd3488f3e396bec3ce0b766bb8070963e7e75bb513b8820b6663e469e530` —
+  PXD token, 2026-05-11. Independent confirmation at a different
+  timestamp (block 422,865 for snk vs. 2026-05-11 for PXD), same
+  4-output shape and same 72-byte mint scriptSig layout. Used to
+  verify the V1 covenant accepts pyrxd's own mint output bytes. PXD
+  deploy reveal: `8eeb333943771991c2752abc78038365ecd76b1a24426f7a3212eea71b6a6564`.
+
+Use the snk mint as the primary golden vector for the V1 mint tx output
+shape and scriptSig layout. See [§8 V1 mint tx
+mechanics](#v1-mint-tx-mechanics-mainnet-verified) for the byte layout
+and PoW preimage construction.
+
 ---
 
 ## Security Best Practices
@@ -3787,7 +3950,7 @@ See [Thumbnail Size vs Cost Tradeoffs](#thumbnail-size-vs-cost-tradeoffs) and [F
 
 ---
 
-**Last Updated:** 2026-05-10 — added Decentralized Mint (dMint) section with V1 contract layout, deploy shape, CBOR schema, and chain-walking patterns; based on byte-by-byte mainnet research from pyrxd's V1 dMint mint + deploy work. See Changelog.
+**Last Updated:** 2026-05-11 — added V1 mint tx mechanics (4-output shape, 72-byte mint scriptSig, PoW preimage construction, `PowPreimageResult` reference API). 2026-05-10 added Decentralized Mint (dMint) section with V1 contract layout, deploy shape, CBOR schema, and chain-walking patterns. Based on byte-by-byte mainnet research from pyrxd's V1 dMint mint + deploy work. See Changelog.
 **Based on Verified Mainnet Transactions:**
 - With thumbnail: `27390efab1e3168c05301b18f6cdfd553a6d122a41496d0f5e104e79a918be7e`
 
@@ -3842,7 +4005,9 @@ and tracks documentation evolution.
 
 | Date | Commit range | Summary |
 |---|---|---|
-| 2026-05-10 | (this commit) | Major dMint expansion: new top-level §8 "Decentralized Mint (dMint)" section with V1 contract byte layout (state 96B + epilogue 145B = 241B), deploy commit/reveal shape (N+3 outputs each), V1 CBOR schema (`p:[1,4]`, no `v`), warning that Photonic-master ships V2-only emitters, opcode-aware classification rule + canonical walker, token-burn defense for funding-input selection, scripthash-history disambiguation pattern, PUSHDATA4 sizing rule for large CBOR bodies, "Known gotchas" subsection covering the four pyrxd compound-doc findings (classifier gap, mint-shape mismatch, hashlock reuse, byte-scan DoS). Anchored with GLYPH deploy commit `a443d9df…878b` and reveal `b965b32d…9dd6`, both added to Verified Working Transactions. Added "First dMint deploy or mint?" routing to FOR AI AGENTS block. Replaced the §19 dMint stub with an in-guide cross-reference. Corrected mis-labeling of dMint contract UTXOs as "FT control / mint-authority." Based on pyrxd M1+M2 byte-by-byte research (`dmint-research-mainnet.md`, `dmint-research-photonic-deploy.md`). |
+| 2026-05-11 | (this commit, pyrxd 0.5.0 audit) | Three follow-ups from the pyrxd 0.5.0 re-audit. (1) **R3 PUSHDATA4 reveal-payload support**: confirmed the GLYPH mainnet reveal `b965b32d…9dd6` uses `OP_PUSHDATA4` (`0x4e`) to push a 65,569-byte CBOR body (over the `OP_PUSHDATA2` 65,535-byte ceiling). The recommended CBOR payload cap is **256 KB** (262,144 bytes) via PUSHDATA4 — already noted in §§8, 11, 12; this changelog row records the verification. (2) **R1 reward-shape statement strengthened**: the §8 V1-vs-V2 table now states explicitly that V2's entire 107-byte output-validation block (the FT-conservation epilogue, `_PART_C` in the pyrxd reference, equal to `_V1_EPILOGUE_SUFFIX[18:]`) is byte-identical to V1's tail — not merely the 12-byte `dec0e9aa76e378e4a269e69d` fingerprint. The whole epilogue is shared, which is what the covenant actually enforces. (3) **Second mainnet mint golden vector locked in**: PXD token mint `c9fdcd3488f3e396bec3ce0b766bb8070963e7e75bb513b8820b6663e469e530` (2026-05-11; deploy reveal `8eeb333943771991c2752abc78038365ecd76b1a24426f7a3212eea71b6a6564`) is now pinned alongside the snk mint `146a4d68…f3c` (block 422,865) as a second independent timestamp confirming the canonical V1 mint scriptSig and 4-output shape. The §8 mainnet-anchors table and §17 golden-vectors table both reference the pair; the §16 Verified Working Transactions entry was updated from "independent confirmation" to its explicit PXD label. No new sections added; edits limited to existing dMint coverage. |
+| 2026-05-11 | (earlier commit) | V1 mint mechanics: added "V1 mint tx mechanics (mainnet-verified)" subsection to §8 covering the canonical 4-output mint tx shape (contract recreate + 75-byte FT reward + OP_RETURN `6a 03 6d7367 …` msg marker + change), the 72-byte V1 mint scriptSig layout (`<0x04 nonce(4)> <0x20 inputHash(32)> <0x20 outputHash(32)> <0x00>`), the V1 PoW preimage construction (`SHA256(outpointTxHash || contractRef) || SHA256(SHA256d(input_script) || SHA256d(output_script))`, hashed with the 4-byte nonce via `SHA256d`), and the `build_pow_preimage` / `build_mint_scriptsig` reference API (now returning `PowPreimageResult(preimage, input_hash, output_hash)`). Anchored against mainnet mints `146a4d68…f3c` and `c9fdcd34…e530`. Fixed broken TOC sub-anchors under §8 and a stray HTML-comment fragment in the Known Gotchas section. Also (same day, separate edit) clarified that V2 mint reward outputs are **byte-identical** to V1 (75-byte FT-wrapped with the same `dec0e9aa76e378e4a269e69d` fingerprint) — the only mint-tx-level V1/V2 difference is the scriptSig nonce width (4 vs 8 bytes). This was caught by a red-team audit of the pyrxd reference implementation, which had a latent bug emitting a plain 25-byte P2PKH at vout[1] for V2 mints; the bug was fixed pre-V2-mainnet-deploy by routing V2 through the same FT-wrapped reward bytecode (`_PART_C`) used by V1. Any implementation emitting a plain P2PKH at vout[1] — V1 or V2 — will be rejected by the covenant. Generalised the §8 reward-shape gotcha to V1+V2 and added explicit V1/V2 rows to the critical-warning table. |
+| 2026-05-10 | (prior) | Major dMint expansion: new top-level §8 "Decentralized Mint (dMint)" section with V1 contract byte layout (state 96B + epilogue 145B = 241B), deploy commit/reveal shape (N+3 outputs each), V1 CBOR schema (`p:[1,4]`, no `v`), warning that Photonic-master ships V2-only emitters, opcode-aware classification rule + canonical walker, token-burn defense for funding-input selection, scripthash-history disambiguation pattern, PUSHDATA4 sizing rule for large CBOR bodies, "Known gotchas" subsection covering the four pyrxd compound-doc findings (classifier gap, mint-shape mismatch, hashlock reuse, byte-scan DoS). Anchored with GLYPH deploy commit `a443d9df…878b` and reveal `b965b32d…9dd6`, both added to Verified Working Transactions. Added "First dMint deploy or mint?" routing to FOR AI AGENTS block. Replaced the §19 dMint stub with an in-guide cross-reference. Corrected mis-labeling of dMint contract UTXOs as "FT control / mint-authority." Based on pyrxd M1+M2 byte-by-byte research (`dmint-research-mainnet.md`, `dmint-research-photonic-deploy.md`). |
 | 2026-04-17 | (prior) | Added MUST-vs-SHOULD tier table for CBOR fields, cross-language regex note for wallet classifiers, multi-library CBOR ecosystem warning, alternative IPFS provider options, CID validation in `uploadFileToPinata`, Changelog section. |
 | 2026-04-17 | `4a9d87d` | Ultrathink review fixes: tx-output validation gate (integer math), radiantjs SHA pin, Radiant Core tarball verification, PINATA_GATEWAY hostname allow-list, `loc_hash` field, `proc_terminate` fallback on signing timeout, MCP guide WIF hardening. Recovery walkthroughs (regtest funding, failed-reveal recovery). FT ref construction by copy-from-existing-UTXO. Anchored 63-byte NFT regex. CBOR attrs restricted to string-keyed primitives. Disclaimer + Ledger-app unaudited note. |
 | 2026-04-16 | `63da546`, `08d623d`, `b2a496b` | Repo renamed to `radiant-glyph-guide`. Section-numbering fixes, scriptSig order corrections, thumbnail-size tradeoff table. Reviewer fixes: precision language, glossary, PII review, FT epilogue opcode decode. |
